@@ -1,0 +1,56 @@
+services:
+  xray:
+    image: ghcr.io/xtls/xray-core:latest
+    container_name: xray
+    restart: unless-stopped
+    command: ["run", "-config", "/etc/xray/config.json"]
+    ports:
+      - "443:443/tcp"
+      - "8443:8443/tcp"
+    volumes:
+      - ./config.json:/etc/xray/config.json:ro
+      - letsencrypt:/etc/letsencrypt:ro
+      - xray-logs:/var/log/xray
+    environment:
+      - TZ=UTC
+    user: "0:0"
+    healthcheck:
+      test: ["CMD", "xray", "run", "-test", "-config", "/etc/xray/config.json"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+  # Авто-обновление сертификата Let's Encrypt для WS+TLS инбаунда.
+  # Первый запуск: см. секцию ниже.
+  certbot:
+    image: certbot/certbot:latest
+    container_name: certbot
+    restart: unless-stopped
+    volumes:
+      - letsencrypt:/etc/letsencrypt:rw
+      - certbot-lib:/var/lib/letsencrypt:rw
+      - certbot-webroot:/var/www/certbot:rw
+    entrypoint: >
+      /bin/sh -c "trap exit TERM; while :; do
+        certbot renew --webroot -w /var/www/certbot --non-interactive --quiet;
+        sleep 12h & wait $${!};
+      done"
+    depends_on:
+      - xray-acme-proxy
+
+  # Минимальный nginx только для ACME challenge (/.well-known/acme-challenge/)
+  xray-acme-proxy:
+    image: nginx:alpine
+    container_name: xray-acme-proxy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - certbot-webroot:/var/www/certbot:ro
+      - ./nginx-acme.conf:/etc/nginx/conf.d/acme.conf:ro
+
+volumes:
+  letsencrypt:
+  certbot-lib:
+  certbot-webroot:
+  xray-logs:
