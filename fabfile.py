@@ -2,12 +2,17 @@
 Fabric-задачи для деплоя xray-сервера.
 
 Использование:
-  fab deploy               — полный деплой (ключи, сертификаты, запуск стека)
-  fab add-client --name=X  — добавить клиента и получить ссылки
-  fab list-clients         — список клиентов с vless-ссылками
-  fab status               — статус контейнеров
-  fab logs [--lines=N]     — логи xray
-  fab restart              — перезапуск xray
+  fab deploy                          — деплой на все серверы
+  fab deploy --host=IP                — деплой на конкретный сервер
+  fab add-client --name=X             — добавить клиента на все серверы
+  fab add-client --name=X --host=IP   — добавить клиента на конкретный сервер
+  fab list-clients [--host=IP]        — список клиентов с vless-ссылками
+  fab status [--host=IP]              — статус контейнеров
+  fab logs [--host=IP] [--lines=N]    — логи xray
+  fab restart [--host=IP]             — перезапуск xray
+
+При нескольких серверах list-clients / status / logs / restart
+требуют явного --host=IP.
 
 Конфигурация через .env (см. .env.example).
 """
@@ -19,6 +24,8 @@ import re
 import tempfile
 import time
 import urllib.parse
+import uuid as _uuid_mod
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -28,40 +35,121 @@ from fabric import Connection, task
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Конфигурация из переменных окружения
+# Глобальные настройки
 # ---------------------------------------------------------------------------
 
-SSH_HOST: str = os.environ.get("SSH_HOST", "")
-SSH_USER: str = os.environ.get("SSH_USER", "root")
-SSH_PASSWORD: str = os.environ.get("SSH_PASSWORD", "")
-STACK_PATH: str = os.environ.get("STACK_PATH", "~/xray-server")
-DOMAIN: str = os.environ.get("DOMAIN", "")
+_STACK_PATH_DEFAULT: str = os.environ.get("STACK_PATH", "~/xray-server")
 CERTBOT_EMAIL: str = os.environ.get("CERTBOT_EMAIL", "")
-
-# True если DOMAIN явно присутствует в окружении (в т.ч. пустая строка).
-# False если ключ не задан вообще — тогда домен унаследуем с сервера.
-_DOMAIN_EXPLICITLY_SET: bool = "DOMAIN" in os.environ
 
 LOCAL_DIR = Path(__file__).parent
 
+
 # ---------------------------------------------------------------------------
-# Утилиты подключения и загрузки файлов
+# Модель сервера
 # ---------------------------------------------------------------------------
 
 
-def _conn() -> Connection:
-    if not SSH_HOST:
+@dataclass
+class ServerConfig:
+    """Конфигурация одного сервера."""
+
+    host: str
+    user: str = "root"
+    password: str = ""
+    domain: Optional[str] = None  # None = унаследовать домен с сервера
+    stack_path: str = ""          # пусто = _STACK_PATH_DEFAULT
+
+    @property
+    def effective_stack_path(self) -> str:
+        return self.stack_path or _STACK_PATH_DEFAULT
+
+    def label(self) -> str:
+        domain_part = f"  domain={self.domain}" if self.domain else ""
+        return f"{self.user}@{self.host}{domain_part}"
+
+
+# ---------------------------------------------------------------------------
+# Загрузка и выбор серверов
+# ---------------------------------------------------------------------------
+
+
+def _load_servers() -> list[ServerConfig]:
+    """Загружает список серверов из переменной SERVERS (JSON-массив)."""
+    raw = os.environ.get("SERVERS", "").strip()
+    if not raw:
         raise SystemExit(
-            "SSH_HOST не задан. Укажи в .env или передай как переменную окружения."
+            "Переменная SERVERS не задана.\n"
+            "Заполни .env (см. .env.example)."
         )
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"SERVERS: неверный JSON — {e}")
+    if not isinstance(data, list) or not data:
+        raise SystemExit("SERVERS должен быть непустым JSON-массивом: [{...}, ...]")
+    servers: list[ServerConfig] = []
+    for i, s in enumerate(data):
+        if "host" not in s:
+            raise SystemExit(f"SERVERS[{i}]: обязательное поле 'host' отсутствует")
+        servers.append(
+            ServerConfig(
+                host=s["host"],
+                user=s.get("user", "root"),
+                password=s.get("password", ""),
+                domain=s.get("domain"),  # None если ключ отсутствует
+                stack_path=s.get("stack_path", ""),
+            )
+        )
+    return servers
+
+
+def _get_servers(host: Optional[str] = None) -> list[ServerConfig]:
+    """Возвращает все серверы или конкретный по host."""
+    servers = _load_servers()
+    if host:
+        matched = [s for s in servers if s.host == host]
+        if not matched:
+            available = ", ".join(s.host for s in servers)
+            raise SystemExit(f"Сервер '{host}' не найден. Доступные: {available}")
+        return matched
+    return servers
+
+
+def _get_single_server(host: Optional[str] = None) -> ServerConfig:
+    """Возвращает один сервер. При нескольких серверах требует явного --host."""
+    servers = _load_servers()
+    if host:
+        matched = [s for s in servers if s.host == host]
+        if not matched:
+            available = ", ".join(s.host for s in servers)
+            raise SystemExit(f"Сервер '{host}' не найден. Доступные: {available}")
+        return matched[0]
+    if len(servers) == 1:
+        return servers[0]
+    options = "\n  ".join(f"--host={s.host}" for s in servers)
+    raise SystemExit(
+        f"Несколько серверов ({len(servers)}). Укажи конкретный:\n  {options}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Соединение и утилиты
+# ---------------------------------------------------------------------------
+
+
+def _conn(server: ServerConfig) -> Connection:
     connect_kwargs: dict = {}
-    if SSH_PASSWORD:
-        connect_kwargs["password"] = SSH_PASSWORD
-    return Connection(host=SSH_HOST, user=SSH_USER, connect_kwargs=connect_kwargs)
+    if server.password:
+        connect_kwargs["password"] = server.password
+    return Connection(
+        host=server.host,
+        user=server.user,
+        connect_kwargs=connect_kwargs,
+    )
 
 
 def _upload_text(c: Connection, content: str, remote_path: str) -> None:
-    """Загружает строковое содержимое в файл на удалённом сервере."""
+    """Загружает строку в файл на удалённом сервере (обрабатывает ~ в пути)."""
     expanded = _expand_remote_path(c, remote_path)
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".tmp", delete=False, encoding="utf-8"
@@ -72,11 +160,6 @@ def _upload_text(c: Connection, content: str, remote_path: str) -> None:
         c.put(tmp, remote=expanded)
     finally:
         os.unlink(tmp)
-
-
-def _stack_project_name() -> str:
-    """Имя проекта docker-compose (basename пути стека)."""
-    return STACK_PATH.rstrip("/").split("/")[-1]
 
 
 _remote_home_cache: dict[str, str] = {}
@@ -91,10 +174,15 @@ def _remote_home(c: Connection) -> str:
 
 
 def _expand_remote_path(c: Connection, path: str) -> str:
-    """Раскрывает ~ в пути (SFTP не понимает тильду, в отличие от shell)."""
+    """Раскрывает ~ в пути (SFTP не понимает тильду)."""
     if path.startswith("~"):
         return path.replace("~", _remote_home(c), 1)
     return path
+
+
+def _stack_project_name(stack_path: str) -> str:
+    """Имя проекта docker-compose (basename пути стека)."""
+    return stack_path.rstrip("/").split("/")[-1]
 
 
 # ---------------------------------------------------------------------------
@@ -115,9 +203,8 @@ def _parse_env_text(text: str) -> dict[str, str]:
     return result
 
 
-def _load_secrets(c: Connection) -> Optional[dict[str, str]]:
-    """Загружает секреты xray из файла .xray-secrets на сервере."""
-    result = c.run(f"cat {STACK_PATH}/{_SECRETS_FILE}", warn=True, hide=True)
+def _load_secrets(c: Connection, stack_path: str) -> Optional[dict[str, str]]:
+    result = c.run(f"cat {stack_path}/{_SECRETS_FILE}", warn=True, hide=True)
     if not result.ok:
         return None
     secrets = _parse_env_text(result.stdout)
@@ -126,27 +213,16 @@ def _load_secrets(c: Connection) -> Optional[dict[str, str]]:
     return None
 
 
-def _save_secrets(c: Connection, secrets: dict[str, str]) -> None:
+def _save_secrets(c: Connection, stack_path: str, secrets: dict[str, str]) -> None:
     content = "\n".join(f"{k}={v}" for k, v in secrets.items()) + "\n"
-    _upload_text(c, content, f"{STACK_PATH}/{_SECRETS_FILE}")
-    c.run(f"chmod 600 {STACK_PATH}/{_SECRETS_FILE}")
+    _upload_text(c, content, f"{stack_path}/{_SECRETS_FILE}")
+    c.run(f"chmod 600 {stack_path}/{_SECRETS_FILE}")
 
 
 def _generate_secrets(c: Connection) -> dict[str, str]:
     """Генерирует UUID, x25519 keypair и short_id через xray в Docker."""
     print("    Генерация UUID...")
-    uuid_out = c.run(
-        "docker run --rm --entrypoint xray ghcr.io/xtls/xray-core:latest uuid",
-        hide=True,
-    ).stdout
-    uuid_m = re.search(
-        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-        uuid_out,
-        re.I,
-    )
-    if not uuid_m:
-        raise RuntimeError(f"Не удалось извлечь UUID из: {uuid_out!r}")
-    uuid = uuid_m.group(0)
+    uuid = str(_uuid_mod.uuid4())
 
     print("    Генерация x25519 keypair (Reality)...")
     kp_out = c.run(
@@ -170,10 +246,7 @@ def _generate_secrets(c: Connection) -> dict[str, str]:
 
 
 def _derive_public_key(c: Connection, private_key: str) -> str:
-    """Вычисляет публичный ключ из приватного через xray x25519 -i.
-
-    Xray выводит: "Password (PublicKey): <key>" или "Public key: <key>".
-    """
+    """Вычисляет публичный ключ из приватного через xray x25519 -i."""
     out = c.run(
         f"docker run --rm --entrypoint xray ghcr.io/xtls/xray-core:latest x25519 -i {private_key}",
         hide=True,
@@ -208,29 +281,28 @@ def _extract_secrets_from_config(
     }
 
 
-def _get_or_create_secrets(c: Connection) -> dict[str, str]:
+def _get_or_create_secrets(c: Connection, stack_path: str) -> dict[str, str]:
     """Возвращает существующие секреты или генерирует новые."""
-    secrets = _load_secrets(c)
+    secrets = _load_secrets(c, stack_path)
     if secrets:
         print("  Секреты найдены на сервере, пропускаем генерацию.")
         return secrets
 
-    # Попытка извлечь из уже существующего конфига на сервере
-    cfg_result = c.run(f"cat {STACK_PATH}/config.json", warn=True, hide=True)
+    cfg_result = c.run(f"cat {stack_path}/config.json", warn=True, hide=True)
     if cfg_result.ok and "YOUR_UUID" not in cfg_result.stdout:
         print("  Извлекаем секреты из существующего config.json на сервере...")
         try:
             cfg = json.loads(cfg_result.stdout)
             secrets = _extract_secrets_from_config(c, cfg)
             if secrets:
-                _save_secrets(c, secrets)
+                _save_secrets(c, stack_path, secrets)
                 return secrets
         except json.JSONDecodeError:
             pass
 
     print("  Генерируем новые секреты xray...")
     secrets = _generate_secrets(c)
-    _save_secrets(c, secrets)
+    _save_secrets(c, stack_path, secrets)
     return secrets
 
 
@@ -239,9 +311,9 @@ def _get_or_create_secrets(c: Connection) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-def _get_server_config(c: Connection) -> Optional[dict]:
-    """Читает текущий config.json с сервера (если он уже заполнен)."""
-    result = c.run(f"cat {STACK_PATH}/config.json", warn=True, hide=True)
+def _get_server_config(c: Connection, stack_path: str) -> Optional[dict]:
+    """Читает текущий config.json с сервера (если он заполнен)."""
+    result = c.run(f"cat {stack_path}/config.json", warn=True, hide=True)
     if result.ok and "YOUR_UUID" not in result.stdout:
         try:
             return json.loads(result.stdout)
@@ -251,7 +323,7 @@ def _get_server_config(c: Connection) -> Optional[dict]:
 
 
 def _get_server_clients(server_config: dict) -> dict[str, list]:
-    """Возвращает словарь inbound_tag → список клиентов из серверного конфига."""
+    """Возвращает inbound_tag → список клиентов из серверного конфига."""
     return {
         ib["tag"]: ib["settings"]["clients"]
         for ib in server_config.get("inbounds", [])
@@ -278,12 +350,7 @@ def _build_config(
     domain: str,
     server_clients: Optional[dict[str, list]] = None,
 ) -> dict:
-    """
-    Собирает конфиг xray из шаблона (config.json):
-    - подставляет секреты и домен
-    - удаляет TLS-инбаунд если домен не задан
-    - сохраняет клиентов с сервера (чтобы не перетирать при повторном деплое)
-    """
+    """Собирает конфиг xray из шаблона: подставляет секреты, домен, сохраняет клиентов."""
     text = (LOCAL_DIR / "config.json").read_text(encoding="utf-8")
     text = text.replace("YOUR_UUID", secrets["XRAY_UUID"])
     text = text.replace("YOUR_PRIVATE_KEY", secrets["XRAY_PRIVATE_KEY"])
@@ -298,7 +365,7 @@ def _build_config(
             ib for ib in config["inbounds"] if ib.get("tag") != "vless-xhttp-tls"
         ]
 
-    # Восстанавливаем клиентов с сервера, если их больше чем в шаблоне
+    # Восстанавливаем клиентов с сервера (чтобы не потерять при re-deploy)
     if server_clients:
         for inbound in config["inbounds"]:
             tag = inbound.get("tag")
@@ -315,22 +382,24 @@ def _build_config(
 # ---------------------------------------------------------------------------
 
 
-def _upload_files(c: Connection, config: dict, domain: str) -> None:
-    c.run(f"mkdir -p {STACK_PATH}")
+def _upload_files(c: Connection, config: dict, domain: str, stack_path: str) -> None:
+    c.run(f"mkdir -p {stack_path}")
 
-    _upload_text(c, json.dumps(config, ensure_ascii=False, indent=2), f"{STACK_PATH}/config.json")
+    _upload_text(
+        c, json.dumps(config, ensure_ascii=False, indent=2), f"{stack_path}/config.json"
+    )
     print("  ✓ config.json")
 
     c.put(
         str(LOCAL_DIR / "docker-compose.yml"),
-        remote=_expand_remote_path(c, f"{STACK_PATH}/docker-compose.yml"),
+        remote=_expand_remote_path(c, f"{stack_path}/docker-compose.yml"),
     )
     print("  ✓ docker-compose.yml")
 
     if domain:
         nginx_conf = (LOCAL_DIR / "nginx-acme.conf").read_text(encoding="utf-8")
         nginx_conf = nginx_conf.replace("YOUR_DOMAIN", domain)
-        _upload_text(c, nginx_conf, f"{STACK_PATH}/nginx-acme.conf")
+        _upload_text(c, nginx_conf, f"{stack_path}/nginx-acme.conf")
         print("  ✓ nginx-acme.conf")
 
 
@@ -349,9 +418,9 @@ def _ensure_docker(c: Connection) -> None:
     print("  ✓ Docker установлен.")
 
 
-def _cert_exists(c: Connection, domain: str) -> bool:
+def _cert_exists(c: Connection, domain: str, stack_path: str) -> bool:
     """Проверяет наличие сертификата в Docker-томе letsencrypt."""
-    proj = _stack_project_name()
+    proj = _stack_project_name(stack_path)
     vol_data = f"/var/lib/docker/volumes/{proj}_letsencrypt/_data"
     result = c.run(
         f"test -f {vol_data}/live/{domain}/fullchain.pem", warn=True, hide=True
@@ -359,15 +428,15 @@ def _cert_exists(c: Connection, domain: str) -> bool:
     return result.ok
 
 
-def _setup_certbot(c: Connection, domain: str, email: str) -> None:
-    """Запускает xray-acme-proxy и получает сертификат через certbot."""
+def _setup_certbot(c: Connection, domain: str, email: str, stack_path: str) -> None:
+    """Получает Let's Encrypt сертификат через certbot."""
     print(f"  Запускаем xray-acme-proxy...")
-    c.run(f"cd {STACK_PATH} && docker compose --profile tls up -d xray-acme-proxy")
+    c.run(f"cd {stack_path} && docker compose --profile tls up -d xray-acme-proxy")
     time.sleep(4)
 
     print(f"  Запрашиваем сертификат для {domain}...")
     c.run(
-        f"cd {STACK_PATH} && docker compose --profile tls run --rm "
+        f"cd {stack_path} && docker compose --profile tls run --rm "
         f"--entrypoint certbot certbot "
         f"certonly --webroot -w /var/www/certbot "
         f"-d {domain} "
@@ -377,12 +446,10 @@ def _setup_certbot(c: Connection, domain: str, email: str) -> None:
     print("  ✓ Сертификат получен.")
 
 
-def _start_stack(c: Connection, domain: str) -> None:
+def _start_stack(c: Connection, domain: str, stack_path: str) -> None:
     profile_arg = "--profile tls" if domain else ""
-    # up -d запускает отсутствующие контейнеры, но не перезапускает уже запущенные.
-    # Xray читает конфиг при старте, поэтому рестарт необходим после изменения config.json.
-    c.run(f"cd {STACK_PATH} && docker compose {profile_arg} up -d")
-    c.run(f"cd {STACK_PATH} && docker compose restart xray")
+    c.run(f"cd {stack_path} && docker compose {profile_arg} up -d")
+    c.run(f"cd {stack_path} && docker compose restart xray")
 
 
 # ---------------------------------------------------------------------------
@@ -443,184 +510,218 @@ def _print_client_links(
 
 
 # ---------------------------------------------------------------------------
-# Fabric-задачи
+# Операции над одним сервером (внутренние)
 # ---------------------------------------------------------------------------
 
 
-@task
-def deploy(ctx):
-    """Полный деплой xray-сервера.
+def _deploy_server(server: ServerConfig) -> None:
+    """Полный деплой на один сервер."""
+    c = _conn(server)
+    sp = server.effective_stack_path
 
-    1. Проверяет/устанавливает Docker
-    2. Генерирует секреты xray (UUID, ключи Reality) — только если не существуют
-    3. Собирает и загружает config.json + docker-compose.yml
-    4. Получает TLS-сертификат (если задан DOMAIN) — только если не существует
-    5. Запускает docker-compose стек
-    """
-    c = _conn()
-    print(f"\n[deploy] {SSH_USER}@{SSH_HOST}  стек: {STACK_PATH}\n")
-
-    c.run(f"mkdir -p {STACK_PATH}")
+    c.run(f"mkdir -p {sp}")
 
     print("[1/5] Проверяем Docker...")
     _ensure_docker(c)
 
     print("[2/5] Секреты xray...")
-    secrets = _get_or_create_secrets(c)
+    secrets = _get_or_create_secrets(c, sp)
 
     print("[3/5] Сборка и загрузка файлов...")
-    server_cfg = _get_server_config(c)
+    server_cfg = _get_server_config(c, sp)
     server_clients = _get_server_clients(server_cfg) if server_cfg else None
-    # Если DOMAIN явно задан в окружении (даже пустой строкой) — используем его.
-    # Иначе наследуем домен из уже развёрнутого конфига на сервере.
-    if _DOMAIN_EXPLICITLY_SET:
-        effective_domain = DOMAIN
+
+    # Effective domain: явный из конфига сервера, или унаследованный с уже задеплоенного
+    if server.domain is not None:
+        effective_domain = server.domain
     else:
         effective_domain = _get_server_domain(server_cfg) if server_cfg else ""
+
     config = _build_config(secrets, effective_domain, server_clients)
-    _upload_files(c, config, effective_domain)
+    _upload_files(c, config, effective_domain, sp)
 
     if effective_domain:
         print(f"[4/5] TLS-сертификат для {effective_domain}...")
-        if _cert_exists(c, effective_domain):
+        if _cert_exists(c, effective_domain, sp):
             print("  Сертификат уже существует, пропускаем.")
         else:
             if not CERTBOT_EMAIL:
-                raise SystemExit(
-                    "CERTBOT_EMAIL не задан в .env — обязателен для получения сертификата."
-                )
-            _setup_certbot(c, effective_domain, CERTBOT_EMAIL)
+                raise SystemExit("CERTBOT_EMAIL не задан в .env")
+            _setup_certbot(c, effective_domain, CERTBOT_EMAIL, sp)
     else:
         print("[4/5] DOMAIN не задан — пропускаем certbot.")
 
     print("[5/5] Запуск стека...")
-    _start_stack(c, effective_domain)
+    _start_stack(c, effective_domain, sp)
 
-    print(f"\n✓ Деплой завершён!\n")
+    print(f"\n✓ Деплой завершён!")
     print("=== Параметры Reality ===")
-    print(f"  Хост:       {SSH_HOST}")
     if effective_domain:
         print(f"  Домен:      {effective_domain}")
     print(f"  Public key: {secrets.get('XRAY_PUBLIC_KEY', 'н/д')}")
     print(f"  Short ID:   {secrets.get('XRAY_SHORT_ID', 'н/д')}")
-    print()
 
 
-@task
-def add_client(ctx, name, level=0):
-    """Добавляет нового клиента в xray и печатает vless-ссылки.
+def _add_client_to_server(
+    server: ServerConfig, name: str, level: int, client_uuid: str
+) -> None:
+    """Добавляет клиента с заданным UUID на один сервер."""
+    c = _conn(server)
+    sp = server.effective_stack_path
 
-    Параметры:
-      --name    имя клиента (обязательно)
-      --level   уровень политики, default=0 (влияет на таймауты и статистику,
-                см. секцию policy в config.json)
-
-    Использование:
-      fab add-client --name=alice
-      fab add-client --name=alice --level=1
-    """
-    c = _conn()
-
-    secrets = _load_secrets(c)
+    secrets = _load_secrets(c, sp)
     if not secrets:
-        raise SystemExit("Секреты не найдены на сервере. Сначала выполни: fab deploy")
+        raise SystemExit(
+            f"[{server.host}] Секреты не найдены. Сначала: fab deploy"
+        )
 
-    cfg_result = c.run(f"cat {STACK_PATH}/config.json", hide=True)
+    cfg_result = c.run(f"cat {sp}/config.json", hide=True)
     config = json.loads(cfg_result.stdout)
 
-    # Проверяем, нет ли уже клиента с таким именем
+    # Проверка дублей
     reality_ib = next(
         (ib for ib in config["inbounds"] if ib.get("tag") == "vless-reality"), None
     )
     if reality_ib:
         existing = [
-            c for c in reality_ib["settings"]["clients"]
-            if c.get("email", "").split("@")[0] == name
+            cl
+            for cl in reality_ib["settings"]["clients"]
+            if cl.get("email", "").split("@")[0] == name
         ]
         if existing:
             raise SystemExit(
-                f"Клиент '{name}' уже существует (UUID: {existing[0]['id']}). "
-                f"Используй другое имя или запусти: fab list-clients"
+                f"[{server.host}] Клиент '{name}' уже существует "
+                f"(UUID: {existing[0]['id']})"
             )
-
-    # Генерируем UUID для нового клиента
-    uuid_out = c.run(
-        "docker run --rm --entrypoint xray ghcr.io/xtls/xray-core:latest uuid",
-        hide=True,
-    ).stdout
-    uuid_m = re.search(
-        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-        uuid_out,
-        re.I,
-    )
-    if not uuid_m:
-        raise RuntimeError("Не удалось сгенерировать UUID для клиента.")
-    client_uuid = uuid_m.group(0)
-    client_level = int(level)
 
     for inbound in config["inbounds"]:
         tag = inbound.get("tag", "")
-        clients: list = inbound["settings"]["clients"]
         if tag == "vless-reality":
-            clients.append(
+            inbound["settings"]["clients"].append(
                 {
                     "id": client_uuid,
                     "flow": "xtls-rprx-vision",
                     "email": f"{name}@reality",
-                    "level": client_level,
+                    "level": level,
                 }
             )
         elif tag == "vless-xhttp-tls":
-            clients.append(
+            inbound["settings"]["clients"].append(
                 {
                     "id": client_uuid,
                     "email": f"{name}@xhttp-tls",
-                    "level": client_level,
+                    "level": level,
                 }
             )
 
     _upload_text(
         c,
         json.dumps(config, ensure_ascii=False, indent=2),
-        f"{STACK_PATH}/config.json",
+        f"{sp}/config.json",
     )
-    c.run(f"cd {STACK_PATH} && docker compose restart xray")
+    c.run(f"cd {sp} && docker compose restart xray")
 
-    effective_domain = DOMAIN or _get_server_domain(config)
-    print(f"\n✓ Клиент '{name}' добавлен  (UUID: {client_uuid}, level: {client_level})\n")
-    _print_client_links(name, client_uuid, secrets, SSH_HOST, effective_domain)
+    effective_domain = (
+        server.domain if server.domain is not None else _get_server_domain(config)
+    )
+    print(
+        f"  ✓ [{server.host}] Клиент '{name}' добавлен "
+        f"(UUID: {client_uuid}, level: {level})"
+    )
+    _print_client_links(name, client_uuid, secrets, server.host, effective_domain or "")
+
+
+# ---------------------------------------------------------------------------
+# Fabric задачи
+# ---------------------------------------------------------------------------
 
 
 @task
-def list_clients(ctx):
-    """Выводит список всех клиентов с vless-ссылками для подключения."""
-    c = _conn()
+def deploy(ctx, host=None):
+    """Полный деплой xray-сервера.
 
-    secrets = _load_secrets(c)
+    По умолчанию деплоит на все серверы из SERVERS последовательно.
+    Идемпотентен: не перегенерирует ключи и не перевыпускает сертификаты.
+
+    Использование:
+      fab deploy
+      fab deploy --host=1.2.3.4
+    """
+    servers = _get_servers(host)
+    for i, server in enumerate(servers, 1):
+        sep = "=" * 60
+        print(f"\n{sep}")
+        print(f"[{i}/{len(servers)}] {server.label()}")
+        print(sep)
+        _deploy_server(server)
+
+
+@task
+def add_client(ctx, name, level=0, host=None):
+    """Добавляет нового клиента на все серверы (или конкретный).
+
+    UUID генерируется один раз и одинаков на всех серверах —
+    достаточно поменять host в ссылке для подключения к другому серверу.
+
+    Параметры:
+      --name    имя клиента (обязательно)
+      --level   уровень политики, default=0
+      --host    конкретный сервер (по умолчанию — все)
+
+    Использование:
+      fab add-client --name=alice
+      fab add-client --name=alice --host=1.2.3.4
+      fab add-client --name=alice --level=1
+    """
+    servers = _get_servers(host)
+    # UUID генерируется один раз для всех серверов
+    client_uuid = str(_uuid_mod.uuid4())
+    client_level = int(level)
+
+    print(f"\nДобавляем клиента '{name}' (UUID: {client_uuid}) на {len(servers)} сервер(а)...\n")
+    for server in servers:
+        _add_client_to_server(server, name, client_level, client_uuid)
+
+
+@task
+def list_clients(ctx, host=None):
+    """Выводит список клиентов с vless-ссылками.
+
+    При нескольких серверах требует --host.
+
+    Использование:
+      fab list-clients
+      fab list-clients --host=1.2.3.4
+    """
+    server = _get_single_server(host)
+    c = _conn(server)
+    sp = server.effective_stack_path
+
+    secrets = _load_secrets(c, sp)
     if not secrets:
-        raise SystemExit("Секреты не найдены на сервере. Сначала выполни: fab deploy")
+        raise SystemExit(f"Секреты не найдены на {server.host}. Сначала: fab deploy")
 
-    cfg_result = c.run(f"cat {STACK_PATH}/config.json", hide=True)
+    cfg_result = c.run(f"cat {sp}/config.json", hide=True)
     config = json.loads(cfg_result.stdout)
 
     reality_inbound = next(
-        (ib for ib in config["inbounds"] if ib.get("tag") == "vless-reality"),
-        None,
+        (ib for ib in config["inbounds"] if ib.get("tag") == "vless-reality"), None
     )
     if not reality_inbound:
-        print("vless-reality инбаунд не найден в конфиге сервера.")
+        print(f"[{server.host}] vless-reality инбаунд не найден.")
         return
 
-    effective_domain = DOMAIN or _get_server_domain(config)
+    effective_domain = (
+        server.domain if server.domain is not None else _get_server_domain(config)
+    )
     clients = reality_inbound["settings"]["clients"]
     policy_levels = config.get("policy", {}).get("levels", {})
 
-    print(f"\nКлиентов: {len(clients)}\n")
+    print(f"\n[{server.host}] Клиентов: {len(clients)}\n")
     for client in clients:
         email = client.get("email", client["id"])
         name = email.split("@")[0]
         lv = client.get("level", 0)
-        lv_info = ""
         if str(lv) in policy_levels:
             p = policy_levels[str(lv)]
             parts = []
@@ -632,31 +733,53 @@ def list_clients(ctx):
         else:
             lv_info = f"  level={lv}"
         print(f"── {name}  ({client['id']}){lv_info}")
-        _print_client_links(name, client["id"], secrets, SSH_HOST, effective_domain)
+        _print_client_links(name, client["id"], secrets, server.host, effective_domain or "")
 
 
 @task
-def status(ctx):
-    """Показывает статус контейнеров на сервере."""
-    c = _conn()
-    c.run(f"cd {STACK_PATH} && docker compose ps")
+def status(ctx, host=None):
+    """Показывает статус контейнеров.
+
+    При нескольких серверах требует --host.
+
+    Использование:
+      fab status
+      fab status --host=1.2.3.4
+    """
+    server = _get_single_server(host)
+    c = _conn(server)
+    c.run(f"cd {server.effective_stack_path} && docker compose ps")
 
 
 @task
-def logs(ctx, lines=50):
+def logs(ctx, host=None, lines=50):
     """Показывает последние логи xray-контейнера.
+
+    При нескольких серверах требует --host.
 
     Использование:
       fab logs
-      fab logs --lines=100
+      fab logs --host=1.2.3.4
+      fab logs --lines=200
     """
-    c = _conn()
-    c.run(f"cd {STACK_PATH} && docker compose logs --tail={lines} xray")
+    server = _get_single_server(host)
+    c = _conn(server)
+    c.run(
+        f"cd {server.effective_stack_path} && docker compose logs --tail={lines} xray"
+    )
 
 
 @task
-def restart(ctx):
-    """Перезапускает xray-контейнер."""
-    c = _conn()
-    c.run(f"cd {STACK_PATH} && docker compose restart xray")
-    print("✓ xray перезапущен.")
+def restart(ctx, host=None):
+    """Перезапускает xray-контейнер.
+
+    При нескольких серверах требует --host.
+
+    Использование:
+      fab restart
+      fab restart --host=1.2.3.4
+    """
+    server = _get_single_server(host)
+    c = _conn(server)
+    c.run(f"cd {server.effective_stack_path} && docker compose restart xray")
+    print(f"✓ [{server.host}] xray перезапущен.")

@@ -38,12 +38,11 @@ cp .env.example .env
 Отредактировать `.env`:
 
 ```env
-SSH_HOST=your-server-ip
-SSH_USER=root
-STACK_PATH=~/xray-server
+# Один сервер с доменом:
+SERVERS=[{"host":"1.2.3.4","user":"root","domain":"vpn.example.com"}]
 
-# Домен опционален. Без него работает только Reality.
-DOMAIN=your-domain.com
+# Глобальные настройки
+STACK_PATH=~/xray-server
 CERTBOT_EMAIL=your@email.com
 ```
 
@@ -53,14 +52,14 @@ CERTBOT_EMAIL=your@email.com
 poetry run fab deploy
 ```
 
-Команда выполнит:
-1. Проверку/установку Docker на сервере
+Команда последовательно на каждом сервере выполнит:
+1. Проверку/установку Docker
 2. Генерацию секретов xray (UUID, ключи Reality) — **только если не существуют**
 3. Сборку `config.json` из шаблона и загрузку файлов
 4. Получение TLS-сертификата через certbot — **только если не существует**
 5. Запуск docker-compose стека
 
-После успешного деплоя в выводе будут показаны параметры для подключения (Public key, Short ID).
+После успешного деплоя выводятся параметры для подключения (Public key, Short ID).
 
 ---
 
@@ -68,29 +67,52 @@ poetry run fab deploy
 
 | Команда | Описание |
 |---|---|
-| `poetry run fab deploy` | Полный деплой / идемпотентное переразвёртывание |
-| `poetry run fab add-client --name=alice` | Добавить клиента и получить ссылки |
-| `poetry run fab list-clients` | Список всех клиентов с vless-ссылками |
-| `poetry run fab status` | Статус контейнеров (`docker compose ps`) |
-| `poetry run fab logs` | Последние 50 строк логов xray |
-| `poetry run fab logs --lines=200` | Указать количество строк логов |
-| `poetry run fab restart` | Перезапустить xray-контейнер |
-| `poetry run fab --list` | Список всех доступных задач |
+| `fab deploy` | Деплой на все серверы |
+| `fab deploy --host=IP` | Деплой на конкретный сервер |
+| `fab add-client --name=alice` | Добавить клиента на все серверы |
+| `fab add-client --name=alice --host=IP` | Добавить клиента на конкретный сервер |
+| `fab list-clients [--host=IP]` | Список клиентов с vless-ссылками |
+| `fab status [--host=IP]` | Статус контейнеров |
+| `fab logs [--host=IP] [--lines=N]` | Логи xray |
+| `fab restart [--host=IP]` | Перезапуск xray |
+| `fab --list` | Список всех доступных задач |
+
+> При нескольких серверах `list-clients`, `status`, `logs`, `restart` требуют явного `--host=IP`.
+
+Для краткости `poetry run` можно заменить на активацию окружения: `poetry shell`, затем просто `fab ...`
 
 ---
 
 ## Конфигурация
 
-### Переменные окружения
+### SERVERS — список серверов
 
-| Переменная | Обязательна | По умолчанию | Описание |
+Основной способ настройки — переменная `SERVERS` в `.env` с JSON-массивом:
+
+```env
+SERVERS=[
+  {"host":"1.2.3.4","user":"root","domain":"vpn1.example.com"},
+  {"host":"5.6.7.8","user":"root"},
+  {"host":"9.10.11.12","user":"ubuntu","password":"secret","domain":"vpn3.example.com","stack_path":"/opt/xray"}
+]
+```
+
+Поля каждого сервера:
+
+| Поле | Обязательное | По умолчанию | Описание |
 |---|---|---|---|
-| `SSH_HOST` | да | — | IP или hostname сервера |
-| `SSH_USER` | нет | `root` | SSH-пользователь |
-| `SSH_PASSWORD` | нет | — | SSH-пароль (если без ключа) |
-| `STACK_PATH` | нет | `~/xray-server` | Путь к стеку на сервере |
-| `DOMAIN` | нет | — | Домен для TLS (если не задан — только Reality) |
-| `CERTBOT_EMAIL` | при DOMAIN | — | Email для Let's Encrypt |
+| `host` | да | — | IP или hostname |
+| `user` | нет | `root` | SSH-пользователь |
+| `password` | нет | — | SSH-пароль (пусто = ключ из системного агента) |
+| `domain` | нет | — | Домен для TLS; пусто = только Reality |
+| `stack_path` | нет | `STACK_PATH` | Путь к стеку на этом сервере |
+
+### Глобальные переменные
+
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `STACK_PATH` | `~/xray-server` | Путь к стеку (можно переопределить на уровне сервера) |
+| `CERTBOT_EMAIL` | — | Email для Let's Encrypt (общий для всех серверов) |
 
 ### config.json
 
