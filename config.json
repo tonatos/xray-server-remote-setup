@@ -68,11 +68,11 @@
         "network": "xhttp",
         "security": "tls",
         "tlsSettings": {
-          "alpn": ["http/1.1"],
+          "alpn": ["h2"],
           "certificates": [
             {
-              "certificateFile": "/etc/letsencrypt/live/test-sni-over-wildcard.ru/fullchain.pem",
-              "keyFile": "/etc/letsencrypt/live/test-sni-over-wildcard.ru/privkey.pem"
+              "certificateFile": "/etc/letsencrypt/live/YOUR_DOMAIN/fullchain.pem",
+              "keyFile": "/etc/letsencrypt/live/YOUR_DOMAIN/privkey.pem"
             }
           ]
         },

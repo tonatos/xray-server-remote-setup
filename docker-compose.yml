@@ -20,11 +20,12 @@ services:
       timeout: 10s
       retries: 3
 
-  # Авто-обновление сертификата Let's Encrypt для WS+TLS инбаунда.
-  # Первый запуск: см. секцию ниже.
+  # Авто-обновление сертификата Let's Encrypt (только при DOMAIN).
+  # Профиль tls активируется через: docker compose --profile tls up -d
   certbot:
     image: certbot/certbot:latest
     container_name: certbot
+    profiles: ["tls"]
     restart: unless-stopped
     volumes:
       - letsencrypt:/etc/letsencrypt:rw
@@ -42,6 +43,7 @@ services:
   xray-acme-proxy:
     image: nginx:alpine
     container_name: xray-acme-proxy
+    profiles: ["tls"]
     restart: unless-stopped
     ports:
       - "80:80"
