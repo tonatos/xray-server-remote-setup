@@ -8,7 +8,10 @@
     "servers": [
       {
         "address": "https://1.1.1.1/dns-query",
-        "domains": ["geosite:geolocation-!cn"],
+        "queryStrategy": "UseIPv4"
+      },
+      {
+        "address": "https://9.9.9.9/dns-query",
         "queryStrategy": "UseIPv4"
       },
       {
