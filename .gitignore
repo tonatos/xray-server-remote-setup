@@ -1,0 +1,11 @@
+# Переменные окружения с секретами
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Poetry
+poetry.lock
