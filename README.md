@@ -79,7 +79,7 @@ poetry run fab deploy
 
 > При нескольких серверах `list-clients`, `status`, `logs`, `restart` требуют явного `--host=IP`.
 
-Для краткости `poetry run` можно заменить на активацию окружения: `poetry shell`, затем просто `fab ...`
+Для краткости `poetry run` можно заменить на активацию окружения: `$(poetry env activate)`, затем просто `fab ...`
 
 ---
 
