@@ -4,9 +4,7 @@ services:
     container_name: xray
     restart: unless-stopped
     command: ["run", "-config", "/etc/xray/config.json"]
-    ports:
-      - "443:443/tcp"
-      - "8443:8443/tcp"
+    network_mode: host
     volumes:
       - ./config.json:/etc/xray/config.json:ro
       - letsencrypt:/etc/letsencrypt:ro

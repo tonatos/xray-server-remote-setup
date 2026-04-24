@@ -8,18 +8,18 @@
     "servers": [
       {
         "address": "https://1.1.1.1/dns-query",
-        "queryStrategy": "UseIPv4"
+        "queryStrategy": "UseIPv4v6"
       },
       {
         "address": "https://9.9.9.9/dns-query",
-        "queryStrategy": "UseIPv4"
+        "queryStrategy": "UseIPv4v6"
       },
       {
         "address": "https://8.8.8.8/dns-query",
-        "queryStrategy": "UseIPv4"
+        "queryStrategy": "UseIPv4v6"
       }
     ],
-    "queryStrategy": "UseIPv4"
+    "queryStrategy": "UseIPv4v6"
   },
   "inbounds": [
     {
@@ -96,7 +96,7 @@
       "tag": "direct",
       "protocol": "freedom",
       "settings": {
-        "domainStrategy": "UseIPv4"
+        "domainStrategy": "UseIPv4v6"
       }
     },
     {
