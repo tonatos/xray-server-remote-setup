@@ -8,6 +8,7 @@ services:
     volumes:
       - ./config.json:/etc/xray/config.json:ro
       - letsencrypt:/etc/letsencrypt:ro
+      - ./certs:/etc/xray/certs:ro
       - xray-logs:/var/log/xray
     environment:
       - TZ=UTC
@@ -48,6 +49,19 @@ services:
     volumes:
       - certbot-webroot:/var/www/certbot:ro
       - ./nginx-acme.conf:/etc/nginx/conf.d/acme.conf:ro
+
+  # Официальный Hysteria2-сервер (UDP). Профиль hysteria включается fab deploy.
+  hysteria:
+    image: tobyxdd/hysteria:latest
+    container_name: hysteria
+    profiles: ["hysteria"]
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./hysteria.yaml:/etc/hysteria.yaml:ro
+      - ./certs:/etc/hysteria/certs:ro
+      - letsencrypt:/etc/letsencrypt:ro
+    command: ["server", "-c", "/etc/hysteria.yaml"]
 
 volumes:
   letsencrypt:

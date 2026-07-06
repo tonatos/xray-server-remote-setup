@@ -8,8 +8,8 @@ Fabric-задачи для деплоя xray-сервера.
   fab add-client --name=X --host=IP   — добавить клиента на конкретный сервер
   fab list-clients [--host=IP]        — список клиентов с vless-ссылками
   fab status [--host=IP]              — статус контейнеров
-  fab logs [--host=IP] [--lines=N]    — логи xray
-  fab restart [--host=IP]             — перезапуск xray
+  fab logs [--host=IP] [--lines=N]    — логи xray или hysteria
+  fab restart [--host=IP]             — перезапуск xray и hysteria
 
 При нескольких серверах list-clients / status / logs / restart
 требуют явного --host=IP.
@@ -40,6 +40,21 @@ load_dotenv()
 
 _STACK_PATH_DEFAULT: str = os.environ.get("STACK_PATH", "~/xray-server")
 CERTBOT_EMAIL: str = os.environ.get("CERTBOT_EMAIL", "")
+_HYSTERIA_CERT_SELF = "/etc/hysteria/certs/fullchain.pem"
+_HYSTERIA_KEY_SELF = "/etc/hysteria/certs/privkey.pem"
+
+
+def _hysteria_settings() -> dict:
+    """Настройки официального Hysteria2-сервера из .env."""
+    enabled_raw = os.environ.get("HYSTERIA_ENABLED", "true").strip().lower()
+    return {
+        "enabled": enabled_raw in ("1", "true", "yes", "on"),
+        "port": int(os.environ.get("HYSTERIA_PORT", "443")),
+        "masquerade_url": os.environ.get(
+            "HYSTERIA_MASQUERADE_URL", "https://addons.mozilla.org/"
+        ).strip(),
+    }
+
 
 LOCAL_DIR = Path(__file__).parent
 
@@ -191,6 +206,10 @@ def _stack_project_name(stack_path: str) -> str:
 
 _SECRETS_FILE = ".xray-secrets"
 _REQUIRED_SECRET_KEYS = ("XRAY_UUID", "XRAY_PRIVATE_KEY", "XRAY_PUBLIC_KEY", "XRAY_SHORT_ID")
+_TLS_CERT_LE = "/etc/letsencrypt/live/{domain}/fullchain.pem"
+_TLS_KEY_LE = "/etc/letsencrypt/live/{domain}/privkey.pem"
+_TLS_CERT_SELF = "/etc/xray/certs/fullchain.pem"
+_TLS_KEY_SELF = "/etc/xray/certs/privkey.pem"
 
 
 def _parse_env_text(text: str) -> dict[str, str]:
@@ -229,8 +248,9 @@ def _generate_secrets(c: Connection) -> dict[str, str]:
         "docker run --rm --entrypoint xray ghcr.io/xtls/xray-core:latest x25519",
         hide=True,
     ).stdout
-    priv_m = re.search(r"Private key:\s*(\S+)", kp_out)
-    pub_m = re.search(r"Public key:\s*(\S+)", kp_out)
+    priv_m = re.search(r"PrivateKey:\s*(\S+)", kp_out)
+    pub_m = re.search(r"Password \(PublicKey\):\s*(\S+)", kp_out)
+    
     if not priv_m or not pub_m:
         raise RuntimeError(f"Не удалось распарсить keypair: {kp_out!r}")
 
@@ -324,25 +344,181 @@ def _get_server_config(c: Connection, stack_path: str) -> Optional[dict]:
 
 def _get_server_clients(server_config: dict) -> dict[str, list]:
     """Возвращает inbound_tag → список клиентов из серверного конфига."""
-    return {
-        ib["tag"]: ib["settings"]["clients"]
-        for ib in server_config.get("inbounds", [])
-        if "settings" in ib and "clients" in ib.get("settings", {})
-    }
+    result: dict[str, list] = {}
+    for ib in server_config.get("inbounds", []):
+        tag = ib.get("tag")
+        if not tag:
+            continue
+        settings = ib.get("settings", {})
+        clients = settings.get("clients") or settings.get("users")
+        if clients:
+            result[tag] = clients
+    return result
+
+
+def _inbound_user_list(inbound: dict) -> list:
+    """Возвращает список клиентов инбаунда (clients или users)."""
+    settings = inbound.get("settings", {})
+    if "users" in settings:
+        return settings["users"]
+    return settings.get("clients", [])
+
+
+def _set_inbound_user_list(inbound: dict, users: list) -> None:
+    """Записывает список клиентов в правильное поле инбаунда."""
+    settings = inbound.setdefault("settings", {})
+    if "users" in settings:
+        settings["users"] = users
+    else:
+        settings["clients"] = users
 
 
 def _get_server_domain(server_config: dict) -> str:
-    """Извлекает домен из TLS-инбаунда серверного конфига."""
+    """Извлекает домен Let's Encrypt из TLS-инбаунда серверного конфига."""
     for ib in server_config.get("inbounds", []):
-        if ib.get("tag") == "vless-xhttp-tls":
-            try:
-                cert = ib["streamSettings"]["tlsSettings"]["certificates"][0]
-                m = re.search(r"/live/([^/]+)/fullchain\.pem", cert["certificateFile"])
-                if m:
-                    return m.group(1)
-            except (KeyError, IndexError):
-                pass
+        if ib.get("tag") != "vless-xhttp-tls":
+            continue
+        try:
+            cert = ib["streamSettings"]["tlsSettings"]["certificates"][0]
+            m = re.search(r"/live/([^/]+)/fullchain\.pem", cert["certificateFile"])
+            if m:
+                return m.group(1)
+        except (KeyError, IndexError):
+            pass
     return ""
+
+
+def _hysteria_tls_paths(domain: str) -> tuple[str, str]:
+    """Пути к TLS-сертификату внутри контейнера hysteria."""
+    if domain:
+        return (
+            _TLS_CERT_LE.format(domain=domain),
+            _TLS_KEY_LE.format(domain=domain),
+        )
+    return _HYSTERIA_CERT_SELF, _HYSTERIA_KEY_SELF
+
+
+def _clients_from_reality_config(config: dict) -> list[dict[str, str]]:
+    """Возвращает [{name, uuid}] из vless-reality инбаунда."""
+    reality = next(
+        (ib for ib in config.get("inbounds", []) if ib.get("tag") == "vless-reality"),
+        None,
+    )
+    if not reality:
+        return []
+    clients: list[dict[str, str]] = []
+    for cl in reality["settings"]["clients"]:
+        email = cl.get("email", cl["id"])
+        clients.append({"name": email.split("@")[0], "uuid": cl["id"]})
+    return clients
+
+
+def _build_hysteria_yaml(
+    clients: list[dict[str, str]], domain: str, settings: dict
+) -> str:
+    """Собирает конфиг официального Hysteria2-сервера."""
+    cert_path, key_path = _hysteria_tls_paths(domain)
+    port = settings["port"]
+    lines = [
+        f"listen: :{port}",
+        "tls:",
+        f"  cert: {cert_path}",
+        f"  key: {key_path}",
+        "auth:",
+        "  type: userpass",
+        "  userpass:",
+    ]
+    if not clients:
+        lines.append("    placeholder: 00000000-0000-0000-0000-000000000000")
+    else:
+        for cl in clients:
+            lines.append(f"    {cl['name']}: {cl['uuid']}")
+    masquerade_url = settings.get("masquerade_url", "")
+    if masquerade_url:
+        lines.extend(
+            [
+                "masquerade:",
+                "  type: proxy",
+                "  proxy:",
+                f"    url: {masquerade_url}",
+                "    rewriteHost: true",
+            ]
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _tls_cert_paths(domain: str) -> tuple[str, str]:
+    """Возвращает пути к TLS-сертификату: LE при домене, иначе самоподписанный."""
+    if domain:
+        return _TLS_CERT_LE.format(domain=domain), _TLS_KEY_LE.format(domain=domain)
+    return _TLS_CERT_SELF, _TLS_KEY_SELF
+
+
+def _cert_fingerprint_sha256(c: Connection, cert_path: str) -> str:
+    out = c.run(
+        f"openssl x509 -noout -fingerprint -sha256 -in {cert_path}",
+        hide=True,
+        warn=True,
+    ).stdout
+    m = re.search(r"SHA256 Fingerprint=([0-9A-F:]+)", out, re.I)
+    if not m:
+        return ""
+    return m.group(1).replace(":", "").lower()
+
+
+def _ensure_self_signed_cert(c: Connection, stack_path: str, host: str) -> str:
+    """Генерирует самоподписанный TLS-сертификат при отсутствии. Возвращает pinSHA256."""
+    certs_dir = f"{stack_path}/certs"
+    cert_file = f"{certs_dir}/fullchain.pem"
+    key_file = f"{certs_dir}/privkey.pem"
+    c.run(f"mkdir -p {certs_dir}")
+    if not c.run(f"test -f {cert_file}", warn=True, hide=True).ok:
+        print(f"  Генерируем самоподписанный TLS-сертификат (CN={host})...")
+        c.run(
+            f"openssl req -x509 -newkey rsa:2048 -keyout {key_file} -out {cert_file} "
+            f"-days 3650 -nodes -subj /CN={host}",
+            hide=True,
+        )
+        c.run(f"chmod 600 {key_file}")
+        print("  ✓ Самоподписанный сертификат создан.")
+    else:
+        print("  Самоподписанный сертификат уже существует.")
+    return _cert_fingerprint_sha256(c, cert_file)
+
+
+def _get_tls_info(
+    server: ServerConfig, config: dict, secrets: dict[str, str]
+) -> tuple[bool, str, str]:
+    """Возвращает (letsencrypt, sni, pin_sha256) для генерации клиентских ссылок."""
+    domain = server.domain if server.domain is not None else _get_server_domain(config)
+    if domain:
+        return True, domain, ""
+    return False, server.host, secrets.get("XRAY_TLS_PIN_SHA256", "")
+
+
+def _sync_clients_from_reality(config: dict) -> None:
+    """Добавляет в xHTTP клиентов из vless-reality, если их там нет."""
+    reality = next(
+        (ib for ib in config["inbounds"] if ib.get("tag") == "vless-reality"), None
+    )
+    if not reality:
+        return
+    by_name = {
+        cl["email"].split("@")[0]: cl for cl in reality["settings"]["clients"]
+    }
+    for inbound in config["inbounds"]:
+        if inbound.get("tag") != "vless-xhttp-tls":
+            continue
+        existing = {cl["email"].split("@")[0] for cl in inbound["settings"]["clients"]}
+        for name, cl in by_name.items():
+            if name not in existing:
+                inbound["settings"]["clients"].append(
+                    {
+                        "id": cl["id"],
+                        "email": f"{name}@xhttp-tls",
+                        "level": cl.get("level", 0),
+                    }
+                )
 
 
 def _build_config(
@@ -350,29 +526,28 @@ def _build_config(
     domain: str,
     server_clients: Optional[dict[str, list]] = None,
 ) -> dict:
-    """Собирает конфиг xray из шаблона: подставляет секреты, домен, сохраняет клиентов."""
+    """Собирает конфиг xray из шаблона: подставляет секреты, TLS-пути, сохраняет клиентов."""
     text = (LOCAL_DIR / "config.json").read_text(encoding="utf-8")
     text = text.replace("YOUR_UUID", secrets["XRAY_UUID"])
     text = text.replace("YOUR_PRIVATE_KEY", secrets["XRAY_PRIVATE_KEY"])
     text = text.replace("YOUR_SHORT_ID", secrets["XRAY_SHORT_ID"])
-    if domain:
-        text = text.replace("YOUR_DOMAIN", domain)
+    cert_path, key_path = _tls_cert_paths(domain)
+    text = text.replace("YOUR_TLS_CERT", cert_path)
+    text = text.replace("YOUR_TLS_KEY", key_path)
 
     config = json.loads(text)
-
-    if not domain:
-        config["inbounds"] = [
-            ib for ib in config["inbounds"] if ib.get("tag") != "vless-xhttp-tls"
-        ]
 
     # Восстанавливаем клиентов с сервера (чтобы не потерять при re-deploy)
     if server_clients:
         for inbound in config["inbounds"]:
             tag = inbound.get("tag")
-            if tag in server_clients and len(server_clients[tag]) > len(
-                inbound["settings"]["clients"]
-            ):
-                inbound["settings"]["clients"] = server_clients[tag]
+            if tag not in server_clients:
+                continue
+            current = _inbound_user_list(inbound)
+            if len(server_clients[tag]) > len(current):
+                _set_inbound_user_list(inbound, server_clients[tag])
+
+    _sync_clients_from_reality(config)
 
     return config
 
@@ -382,13 +557,24 @@ def _build_config(
 # ---------------------------------------------------------------------------
 
 
-def _upload_files(c: Connection, config: dict, domain: str, stack_path: str) -> None:
+def _upload_files(
+    c: Connection,
+    config: dict,
+    domain: str,
+    stack_path: str,
+    *,
+    hysteria_yaml: Optional[str] = None,
+) -> None:
     c.run(f"mkdir -p {stack_path}")
 
     _upload_text(
         c, json.dumps(config, ensure_ascii=False, indent=2), f"{stack_path}/config.json"
     )
     print("  ✓ config.json")
+
+    if hysteria_yaml is not None:
+        _upload_text(c, hysteria_yaml, f"{stack_path}/hysteria.yaml")
+        print("  ✓ hysteria.yaml")
 
     c.put(
         str(LOCAL_DIR / "docker-compose.yml"),
@@ -446,10 +632,40 @@ def _setup_certbot(c: Connection, domain: str, email: str, stack_path: str) -> N
     print("  ✓ Сертификат получен.")
 
 
-def _start_stack(c: Connection, domain: str, stack_path: str) -> None:
-    profile_arg = "--profile tls" if domain else ""
+def _compose_profiles(domain: str, hysteria_enabled: bool) -> str:
+    """Возвращает аргумент --profile для docker compose."""
+    profiles: list[str] = []
+    if domain:
+        profiles.append("tls")
+    if hysteria_enabled:
+        profiles.append("hysteria")
+    if not profiles:
+        return ""
+    return " ".join(f"--profile {p}" for p in profiles)
+
+
+def _start_stack(
+    c: Connection, domain: str, stack_path: str, hysteria_enabled: bool
+) -> None:
+    profile_arg = _compose_profiles(domain, hysteria_enabled)
     c.run(f"cd {stack_path} && docker compose {profile_arg} up -d")
     c.run(f"cd {stack_path} && docker compose restart xray")
+    if hysteria_enabled:
+        c.run(f"cd {stack_path} && docker compose {profile_arg} restart hysteria")
+    else:
+        c.run(
+            f"cd {stack_path} && docker compose --profile hysteria stop hysteria",
+            warn=True,
+            hide=True,
+        )
+        c.run("docker rm -f hysteria", warn=True, hide=True)
+
+
+def _restart_stack(c: Connection, domain: str, stack_path: str, hysteria_enabled: bool) -> None:
+    profile_arg = _compose_profiles(domain, hysteria_enabled)
+    c.run(f"cd {stack_path} && docker compose restart xray")
+    if hysteria_enabled:
+        c.run(f"cd {stack_path} && docker compose {profile_arg} restart hysteria")
 
 
 # ---------------------------------------------------------------------------
@@ -465,7 +681,7 @@ def _vless_reality_link(
             "encryption": "none",
             "flow": "xtls-rprx-vision",
             "security": "reality",
-            "sni": "www.microsoft.com",
+            "sni": "addons.mozilla.org",
             "fp": "chrome",
             "pbk": public_key,
             "sid": short_id,
@@ -476,18 +692,51 @@ def _vless_reality_link(
     return f"vless://{uuid}@{host}:443?{params}#{tag}"
 
 
-def _vless_xhttp_link(uuid: str, host: str, domain: str, name: str) -> str:
-    params = urllib.parse.urlencode(
-        {
-            "encryption": "none",
-            "security": "tls",
-            "sni": domain,
-            "type": "xhttp",
-            "path": "/xhttp",
-        }
-    )
+def _vless_xhttp_link(
+    uuid: str,
+    host: str,
+    sni: str,
+    name: str,
+    *,
+    pin_sha256: str = "",
+) -> str:
+    params: dict[str, str] = {
+        "encryption": "none",
+        "security": "tls",
+        "sni": sni,
+        "type": "xhttp",
+        "path": "/api/v1/sync",
+        "mode": "auto",
+    }
+    if pin_sha256:
+        params["pcs"] = pin_sha256
+    query = urllib.parse.urlencode(params)
     tag = urllib.parse.quote(f"{name}-xHTTP-TLS")
-    return f"vless://{uuid}@{host}:8443?{params}#{tag}"
+    return f"vless://{uuid}@{host}:8443?{query}#{tag}"
+
+
+def _hysteria2_link(
+    name: str,
+    uuid: str,
+    host: str,
+    port: int,
+    sni: str,
+    *,
+    insecure: bool = False,
+    pin_sha256: str = "",
+) -> str:
+    auth = (
+        f"{urllib.parse.quote(name, safe='')}"
+        f":{urllib.parse.quote(uuid, safe='')}"
+    )
+    params: dict[str, str] = {"sni": sni}
+    if insecure:
+        params["insecure"] = "1"
+    if pin_sha256:
+        params["pinSHA256"] = pin_sha256
+    query = urllib.parse.urlencode(params)
+    tag = urllib.parse.quote(f"{name}-Hysteria2")
+    return f"hysteria2://{auth}@{host}:{port}?{query}#{tag}"
 
 
 def _print_client_links(
@@ -495,7 +744,11 @@ def _print_client_links(
     uuid: str,
     secrets: dict[str, str],
     host: str,
-    domain: str,
+    *,
+    use_letsencrypt: bool,
+    sni: str,
+    pin_sha256: str = "",
+    hysteria_settings: Optional[dict] = None,
 ) -> None:
     pub = secrets.get("XRAY_PUBLIC_KEY", "")
     sid = secrets.get("XRAY_SHORT_ID", "")
@@ -504,9 +757,23 @@ def _print_client_links(
         link = _vless_reality_link(uuid, host, pub, sid, name)
         print(f"  VLESS Reality:\n  {link}\n")
 
-    if domain:
-        link = _vless_xhttp_link(uuid, host, domain, name)
-        print(f"  VLESS xHTTP+TLS:\n  {link}\n")
+    link = _vless_xhttp_link(
+        uuid, host, sni, name, pin_sha256="" if use_letsencrypt else pin_sha256
+    )
+    print(f"  VLESS xHTTP+TLS:\n  {link}\n")
+
+    hy = hysteria_settings or _hysteria_settings()
+    if hy["enabled"]:
+        link = _hysteria2_link(
+            name,
+            uuid,
+            host,
+            hy["port"],
+            sni,
+            insecure=not use_letsencrypt,
+            pin_sha256=pin_sha256 if not use_letsencrypt else "",
+        )
+        print(f"  Hysteria2:\n  {link}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -538,10 +805,20 @@ def _deploy_server(server: ServerConfig) -> None:
         effective_domain = _get_server_domain(server_cfg) if server_cfg else ""
 
     config = _build_config(secrets, effective_domain, server_clients)
-    _upload_files(c, config, effective_domain, sp)
+    hy_settings = _hysteria_settings()
+    hysteria_yaml = (
+        _build_hysteria_yaml(
+            _clients_from_reality_config(config), effective_domain, hy_settings
+        )
+        if hy_settings["enabled"]
+        else None
+    )
+    _upload_files(
+        c, config, effective_domain, sp, hysteria_yaml=hysteria_yaml
+    )
 
     if effective_domain:
-        print(f"[4/5] TLS-сертификат для {effective_domain}...")
+        print(f"[4/5] TLS-сертификат Let's Encrypt для {effective_domain}...")
         if _cert_exists(c, effective_domain, sp):
             print("  Сертификат уже существует, пропускаем.")
         else:
@@ -549,15 +826,25 @@ def _deploy_server(server: ServerConfig) -> None:
                 raise SystemExit("CERTBOT_EMAIL не задан в .env")
             _setup_certbot(c, effective_domain, CERTBOT_EMAIL, sp)
     else:
-        print("[4/5] DOMAIN не задан — пропускаем certbot.")
+        print("[4/5] Домен не задан — самоподписанный TLS-сертификат...")
+        pin = _ensure_self_signed_cert(c, sp, server.host)
+        if pin and secrets.get("XRAY_TLS_PIN_SHA256") != pin:
+            secrets["XRAY_TLS_PIN_SHA256"] = pin
+            _save_secrets(c, sp, secrets)
 
     print("[5/5] Запуск стека...")
-    _start_stack(c, effective_domain, sp)
+    _start_stack(c, effective_domain, sp, hy_settings["enabled"])
 
     print(f"\n✓ Деплой завершён!")
     print("=== Параметры Reality ===")
     if effective_domain:
-        print(f"  Домен:      {effective_domain}")
+        print(f"  Домен:      {effective_domain} (Let's Encrypt)")
+    else:
+        print(f"  TLS:        самоподписанный (SNI={server.host})")
+        if secrets.get("XRAY_TLS_PIN_SHA256"):
+            print(f"  pinSHA256:  {secrets['XRAY_TLS_PIN_SHA256']}")
+    if hy_settings["enabled"]:
+        print(f"  Hysteria2:  UDP {hy_settings['port']} (apernet/hysteria)")
     print(f"  Public key: {secrets.get('XRAY_PUBLIC_KEY', 'н/д')}")
     print(f"  Short ID:   {secrets.get('XRAY_SHORT_ID', 'н/д')}")
 
@@ -614,21 +901,45 @@ def _add_client_to_server(
                 }
             )
 
+    hy_settings = _hysteria_settings()
+    effective_domain = (
+        server.domain if server.domain is not None else _get_server_domain(config)
+    )
+    hysteria_yaml = (
+        _build_hysteria_yaml(
+            _clients_from_reality_config(config), effective_domain, hy_settings
+        )
+        if hy_settings["enabled"]
+        else None
+    )
+
     _upload_text(
         c,
         json.dumps(config, ensure_ascii=False, indent=2),
         f"{sp}/config.json",
     )
-    c.run(f"cd {sp} && docker compose restart xray")
+    if hysteria_yaml is not None:
+        _upload_text(c, hysteria_yaml, f"{sp}/hysteria.yaml")
 
-    effective_domain = (
-        server.domain if server.domain is not None else _get_server_domain(config)
-    )
+    _restart_stack(c, effective_domain, sp, hy_settings["enabled"])
+
+    use_le, sni, pin = _get_tls_info(server, config, secrets)
+    if not use_le and not pin:
+        pin = _cert_fingerprint_sha256(c, f"{sp}/certs/fullchain.pem")
     print(
         f"  ✓ [{server.host}] Клиент '{name}' добавлен "
         f"(UUID: {client_uuid}, level: {level})"
     )
-    _print_client_links(name, client_uuid, secrets, server.host, effective_domain or "")
+    _print_client_links(
+        name,
+        client_uuid,
+        secrets,
+        server.host,
+        use_letsencrypt=use_le,
+        sni=sni,
+        pin_sha256=pin,
+        hysteria_settings=hy_settings,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -711,9 +1022,9 @@ def list_clients(ctx, host=None):
         print(f"[{server.host}] vless-reality инбаунд не найден.")
         return
 
-    effective_domain = (
-        server.domain if server.domain is not None else _get_server_domain(config)
-    )
+    use_le, sni, pin = _get_tls_info(server, config, secrets)
+    if not use_le and not pin:
+        pin = _cert_fingerprint_sha256(c, f"{sp}/certs/fullchain.pem")
     clients = reality_inbound["settings"]["clients"]
     policy_levels = config.get("policy", {}).get("levels", {})
 
@@ -733,7 +1044,16 @@ def list_clients(ctx, host=None):
         else:
             lv_info = f"  level={lv}"
         print(f"── {name}  ({client['id']}){lv_info}")
-        _print_client_links(name, client["id"], secrets, server.host, effective_domain or "")
+        _print_client_links(
+            name,
+            client["id"],
+            secrets,
+            server.host,
+            use_letsencrypt=use_le,
+            sni=sni,
+            pin_sha256=pin,
+            hysteria_settings=_hysteria_settings(),
+        )
 
 
 @task
@@ -752,8 +1072,8 @@ def status(ctx, host=None):
 
 
 @task
-def logs(ctx, host=None, lines=50):
-    """Показывает последние логи xray-контейнера.
+def logs(ctx, host=None, lines=50, service="xray"):
+    """Показывает последние логи контейнера (xray или hysteria).
 
     При нескольких серверах требует --host.
 
@@ -761,17 +1081,22 @@ def logs(ctx, host=None, lines=50):
       fab logs
       fab logs --host=1.2.3.4
       fab logs --lines=200
+      fab logs --service=hysteria
     """
+    if service not in ("xray", "hysteria"):
+        raise SystemExit("service должен быть xray или hysteria")
     server = _get_single_server(host)
     c = _conn(server)
+    sp = server.effective_stack_path
+    profile_arg = "--profile hysteria" if service == "hysteria" else ""
     c.run(
-        f"cd {server.effective_stack_path} && docker compose logs --tail={lines} xray"
+        f"cd {sp} && docker compose {profile_arg} logs --tail={lines} {service}"
     )
 
 
 @task
 def restart(ctx, host=None):
-    """Перезапускает xray-контейнер.
+    """Перезапускает xray и hysteria (если включён).
 
     При нескольких серверах требует --host.
 
@@ -781,5 +1106,18 @@ def restart(ctx, host=None):
     """
     server = _get_single_server(host)
     c = _conn(server)
-    c.run(f"cd {server.effective_stack_path} && docker compose restart xray")
-    print(f"✓ [{server.host}] xray перезапущен.")
+    sp = server.effective_stack_path
+    cfg_result = c.run(f"cat {sp}/config.json", warn=True, hide=True)
+    effective_domain = ""
+    if cfg_result.ok:
+        try:
+            config = json.loads(cfg_result.stdout)
+            effective_domain = (
+                server.domain
+                if server.domain is not None
+                else _get_server_domain(config)
+            )
+        except json.JSONDecodeError:
+            pass
+    _restart_stack(c, effective_domain, sp, _hysteria_settings()["enabled"])
+    print(f"✓ [{server.host}] стек перезапущен.")

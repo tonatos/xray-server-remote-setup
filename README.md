@@ -3,8 +3,9 @@
 Автоматизированный деплой [Xray-core](https://github.com/XTLS/Xray-core) на удалённый VPS через [Fabric](https://www.fabfile.org/).
 
 Поддерживаемые протоколы:
-- **VLESS + XTLS-Reality** (порт 443) — работает без домена
-- **VLESS + xHTTP + TLS** (порт 8443) — требует домен с Let's Encrypt-сертификатом
+- **VLESS + XTLS-Reality** (порт 443/TCP) — работает без домена
+- **VLESS + xHTTP + TLS** (порт 8443/TCP) — TLS: Let's Encrypt при наличии домена, иначе самоподписанный
+- **Hysteria 2** (порт 443/UDP) — официальный сервер [apernet/hysteria](https://github.com/apernet/hysteria) в отдельном контейнере; TLS как у xHTTP
 
 ---
 
@@ -71,10 +72,10 @@ poetry run fab deploy
 | `fab deploy --host=IP` | Деплой на конкретный сервер |
 | `fab add-client --name=alice` | Добавить клиента на все серверы |
 | `fab add-client --name=alice --host=IP` | Добавить клиента на конкретный сервер |
-| `fab list-clients [--host=IP]` | Список клиентов с vless-ссылками |
+| `fab list-clients [--host=IP]` | Список клиентов с vless- и hysteria2-ссылками |
 | `fab status [--host=IP]` | Статус контейнеров |
-| `fab logs [--host=IP] [--lines=N]` | Логи xray |
-| `fab restart [--host=IP]` | Перезапуск xray |
+| `fab logs [--host=IP] [--lines=N] [--service=xray\|hysteria]` | Логи xray или hysteria |
+| `fab restart [--host=IP]` | Перезапуск xray и hysteria (если включён) |
 | `fab --list` | Список всех доступных задач |
 
 > При нескольких серверах `list-clients`, `status`, `logs`, `restart` требуют явного `--host=IP`.
@@ -104,7 +105,7 @@ SERVERS=[
 | `host` | да | — | IP или hostname |
 | `user` | нет | `root` | SSH-пользователь |
 | `password` | нет | — | SSH-пароль (пусто = ключ из системного агента) |
-| `domain` | нет | — | Домен для TLS; пусто = только Reality |
+| `domain` | нет | — | Домен для Let's Encrypt; без него xHTTP/Hysteria2 используют самоподписанный TLS |
 | `stack_path` | нет | `STACK_PATH` | Путь к стеку на этом сервере |
 
 ### Глобальные переменные
@@ -113,6 +114,9 @@ SERVERS=[
 |---|---|---|
 | `STACK_PATH` | `~/xray-server` | Путь к стеку (можно переопределить на уровне сервера) |
 | `CERTBOT_EMAIL` | — | Email для Let's Encrypt (общий для всех серверов) |
+| `HYSTERIA_ENABLED` | `true` | Включить официальный Hysteria2-сервер (отдельный контейнер) |
+| `HYSTERIA_PORT` | `443` | UDP-порт Hysteria2 |
+| `HYSTERIA_MASQUERADE_URL` | `https://addons.mozilla.org/` | URL для HTTP/3-маскировки при неудачной аутентификации |
 
 ### config.json
 
@@ -123,7 +127,8 @@ SERVERS=[
 | `YOUR_UUID` | UUID клиента (генерируется один раз) |
 | `YOUR_PRIVATE_KEY` | Приватный ключ Reality (x25519) |
 | `YOUR_SHORT_ID` | Short ID для Reality |
-| `YOUR_DOMAIN` | Домен из переменной `DOMAIN` |
+| `YOUR_TLS_CERT` | Путь к TLS-сертификату (Let's Encrypt или самоподписанный) |
+| `YOUR_TLS_KEY` | Путь к приватному ключу TLS |
 
 Файл можно редактировать напрямую — при следующем `fab deploy` структурные изменения применятся, а список клиентов сохранится.
 
@@ -148,9 +153,9 @@ poetry run fab add-client --name=bob --level=1   # другой уровень �
 Команда:
 1. Проверяет, что клиент с таким именем не существует
 2. Генерирует новый UUID для клиента
-3. Добавляет клиента во все активные инбаунды с указанным уровнем
-4. Перезапускает xray
-5. Выводит готовые vless-ссылки
+3. Добавляет клиента в xray-инбаунды (Reality, xHTTP) и в `hysteria.yaml` (если включён)
+4. Перезапускает xray и hysteria
+5. Выводит готовые vless- и hysteria2-ссылки
 
 Пример вывода:
 ```
@@ -161,6 +166,11 @@ poetry run fab add-client --name=bob --level=1   # другой уровень �
 
   VLESS xHTTP+TLS:
   vless://3f2a1b4c-...@1.2.3.4:8443?encryption=none&security=tls&...#alice-xHTTP-TLS
+
+  Hysteria2:
+  hysteria2://alice:3f2a1b4c-...@1.2.3.4:443?sni=vpn.example.com#alice-Hysteria2
+
+Без домена ссылки xHTTP содержат `pcs` (SHA-256 fingerprint сертификата), Hysteria2 — `insecure=1` и `pinSHA256`. Аутентификация Hysteria2: логин = имя клиента, пароль = UUID.
 ```
 
 ### Список клиентов
@@ -232,7 +242,8 @@ xray-server/
 ├── fabfile.py          # Fabric-задачи (деплой, управление клиентами)
 ├── pyproject.toml      # Python-зависимости (Poetry)
 ├── config.json         # Шаблон конфигурации xray (редактируется)
-├── docker-compose.yml  # Стек: xray + certbot + nginx (ACME)
+├── docker-compose.yml  # Стек: xray + hysteria + certbot + nginx (ACME)
+├── hysteria.yaml       # Генерируется fab deploy (не коммитить на сервере)
 ├── nginx-acme.conf     # Nginx для ACME challenge
 ├── .env                # Локальные переменные окружения (git-ignored)
 ├── .env.example        # Шаблон .env
@@ -247,10 +258,14 @@ xray-server/
 [клиент]
     │
     ├─ 443/TCP ──→ [xray: VLESS Reality]
-    │               └─ маскировка под www.microsoft.com
+    │               └─ маскировка под addons.mozilla.org
     │
-    └─ 8443/TCP ─→ [xray: VLESS xHTTP+TLS]  ← только при наличии домена
-                    └─ TLS-сертификат от Let's Encrypt
+    ├─ 8443/TCP ─→ [xray: VLESS xHTTP+TLS]
+    │               └─ Let's Encrypt (с доменом) или самоподписанный TLS
+    │
+    └─ 443/UDP ──→ [hysteria: официальный Hysteria2]
+                    └─ Let's Encrypt (с доменом) или самоподписанный TLS
+                    └─ клиенты синхронизируются из vless-reality (userpass)
 
 [certbot] ─ автообновление сертификата каждые 12ч
 [nginx]   ─ отдаёт ACME challenge на порту 80
@@ -259,6 +274,7 @@ xray-server/
 Docker-профили:
 - `docker compose up -d` — только `xray` (без домена)
 - `docker compose --profile tls up -d` — `xray` + `certbot` + `nginx` (с доменом)
+- `docker compose --profile hysteria up -d` — добавляет контейнер `hysteria` (включается через `HYSTERIA_ENABLED=true`)
 
 ---
 

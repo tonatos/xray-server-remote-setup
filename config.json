@@ -41,11 +41,12 @@
         "security": "reality",
         "realitySettings": {
           "show": false,
-          "dest": "www.microsoft.com:443",
+          "dest": "addons.mozilla.org:443",
           "xver": 0,
-          "serverNames": ["www.microsoft.com"],
+          "serverNames": ["addons.mozilla.org", "addons.cdn.mozilla.net"],
           "privateKey": "YOUR_PRIVATE_KEY",
-          "shortIds": ["YOUR_SHORT_ID"]
+          "shortIds": ["YOUR_SHORT_ID"],
+          "fingerprint": "chrome"
         }
       },
       "sniffing": {
@@ -74,13 +75,13 @@
           "alpn": ["h2"],
           "certificates": [
             {
-              "certificateFile": "/etc/letsencrypt/live/YOUR_DOMAIN/fullchain.pem",
-              "keyFile": "/etc/letsencrypt/live/YOUR_DOMAIN/privkey.pem"
+              "certificateFile": "YOUR_TLS_CERT",
+              "keyFile": "YOUR_TLS_KEY"
             }
           ]
         },
         "xhttpSettings": {
-          "path": "/xhttp",
+          "path": "/api/v1/sync",
           "mode": "auto"
         }
       },
