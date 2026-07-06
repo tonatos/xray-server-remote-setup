@@ -13,7 +13,7 @@
 
 **Локально:**
 - Python 3.11+
-- [Poetry](https://python-poetry.org/docs/#installation)
+- [uv](https://docs.astral.sh/uv/getting-started/installation/)
 - SSH-доступ к серверу по публичному ключу
 
 **На сервере:**
@@ -27,7 +27,7 @@
 ### 1. Установить зависимости
 
 ```bash
-poetry install
+uv sync
 ```
 
 ### 2. Настроить переменные окружения
@@ -50,7 +50,7 @@ CERTBOT_EMAIL=your@email.com
 ### 3. Задеплоить
 
 ```bash
-poetry run fab deploy
+uv run fab deploy
 ```
 
 Команда последовательно на каждом сервере выполнит:
@@ -80,7 +80,7 @@ poetry run fab deploy
 
 > При нескольких серверах `list-clients`, `status`, `logs`, `restart` требуют явного `--host=IP`.
 
-Для краткости `poetry run` можно заменить на активацию окружения: `$(poetry env activate)`, затем просто `fab ...`
+Для краткости `uv run` можно заменить на активацию окружения: `source .venv/bin/activate`, затем просто `fab ...`
 
 ---
 
@@ -139,8 +139,8 @@ SERVERS=[
 ### Добавить клиента
 
 ```bash
-poetry run fab add-client --name=alice
-poetry run fab add-client --name=bob --level=1   # другой уровень политики
+uv run fab add-client --name=alice
+uv run fab add-client --name=bob --level=1   # другой уровень политики
 ```
 
 Параметры:
@@ -176,7 +176,7 @@ poetry run fab add-client --name=bob --level=1   # другой уровень �
 ### Список клиентов
 
 ```bash
-poetry run fab list-clients
+uv run fab list-clients
 ```
 
 ### Настройки клиентов в xray-core
@@ -240,7 +240,8 @@ xray-core поддерживает следующие поля для каждо
 ```
 xray-server/
 ├── fabfile.py          # Fabric-задачи (деплой, управление клиентами)
-├── pyproject.toml      # Python-зависимости (Poetry)
+├── pyproject.toml      # Python-зависимости (uv)
+├── uv.lock             # Lockfile зависимостей
 ├── config.json         # Шаблон конфигурации xray (редактируется)
 ├── docker-compose.yml  # Стек: xray + hysteria + certbot + nginx (ACME)
 ├── hysteria.yaml       # Генерируется fab deploy (не коммитить на сервере)
