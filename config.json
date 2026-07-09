@@ -24,7 +24,7 @@
   "inbounds": [
     {
       "tag": "vless-reality",
-      "port": 443,
+      "port": 9443,
       "protocol": "vless",
       "settings": {
         "clients": [

@@ -73,6 +73,9 @@ class ServerConfig:
     password: str = ""
     domain: Optional[str] = None  # None = унаследовать домен с сервера
     stack_path: str = ""          # пусто = _STACK_PATH_DEFAULT
+    tls_mode: str = "certbot"       # certbot | external
+    external_tls_cert: str = ""     # путь на хосте (для tls_mode=external)
+    external_tls_key: str = ""      # путь на хосте (для tls_mode=external)
 
     @property
     def effective_stack_path(self) -> str:
@@ -106,6 +109,12 @@ def _load_servers() -> list[ServerConfig]:
     for i, s in enumerate(data):
         if "host" not in s:
             raise SystemExit(f"SERVERS[{i}]: обязательное поле 'host' отсутствует")
+        tls_mode = s.get("tls_mode", "certbot").strip().lower()
+        if tls_mode not in ("certbot", "external"):
+            raise SystemExit(
+                f"SERVERS[{i}]: tls_mode должен быть certbot или external, "
+                f"получено: {tls_mode!r}"
+            )
         servers.append(
             ServerConfig(
                 host=s["host"],
@@ -113,6 +122,9 @@ def _load_servers() -> list[ServerConfig]:
                 password=s.get("password", ""),
                 domain=s.get("domain"),  # None если ключ отсутствует
                 stack_path=s.get("stack_path", ""),
+                tls_mode=tls_mode,
+                external_tls_cert=s.get("external_tls_cert", "").strip(),
+                external_tls_key=s.get("external_tls_key", "").strip(),
             )
         )
     return servers
@@ -208,6 +220,8 @@ _SECRETS_FILE = ".xray-secrets"
 _REQUIRED_SECRET_KEYS = ("XRAY_UUID", "XRAY_PRIVATE_KEY", "XRAY_PUBLIC_KEY", "XRAY_SHORT_ID")
 _TLS_CERT_LE = "/etc/letsencrypt/live/{domain}/fullchain.pem"
 _TLS_KEY_LE = "/etc/letsencrypt/live/{domain}/privkey.pem"
+_TLS_CERT_EXTERNAL = "/etc/external-tls/fullchain.pem"
+_TLS_KEY_EXTERNAL = "/etc/external-tls/privkey.pem"
 _TLS_CERT_SELF = "/etc/xray/certs/fullchain.pem"
 _TLS_KEY_SELF = "/etc/xray/certs/privkey.pem"
 
@@ -388,9 +402,11 @@ def _get_server_domain(server_config: dict) -> str:
     return ""
 
 
-def _hysteria_tls_paths(domain: str) -> tuple[str, str]:
+def _hysteria_tls_paths(domain: str, tls_mode: str = "certbot") -> tuple[str, str]:
     """Пути к TLS-сертификату внутри контейнера hysteria."""
     if domain:
+        if tls_mode == "external":
+            return _TLS_CERT_EXTERNAL, _TLS_KEY_EXTERNAL
         return (
             _TLS_CERT_LE.format(domain=domain),
             _TLS_KEY_LE.format(domain=domain),
@@ -414,10 +430,14 @@ def _clients_from_reality_config(config: dict) -> list[dict[str, str]]:
 
 
 def _build_hysteria_yaml(
-    clients: list[dict[str, str]], domain: str, settings: dict
+    clients: list[dict[str, str]],
+    domain: str,
+    settings: dict,
+    *,
+    tls_mode: str = "certbot",
 ) -> str:
     """Собирает конфиг официального Hysteria2-сервера."""
-    cert_path, key_path = _hysteria_tls_paths(domain)
+    cert_path, key_path = _hysteria_tls_paths(domain, tls_mode)
     port = settings["port"]
     lines = [
         f"listen: :{port}",
@@ -447,9 +467,11 @@ def _build_hysteria_yaml(
     return "\n".join(lines) + "\n"
 
 
-def _tls_cert_paths(domain: str) -> tuple[str, str]:
-    """Возвращает пути к TLS-сертификату: LE при домене, иначе самоподписанный."""
+def _tls_cert_paths(domain: str, tls_mode: str = "certbot") -> tuple[str, str]:
+    """Возвращает пути к TLS-сертификату внутри контейнера."""
     if domain:
+        if tls_mode == "external":
+            return _TLS_CERT_EXTERNAL, _TLS_KEY_EXTERNAL
         return _TLS_CERT_LE.format(domain=domain), _TLS_KEY_LE.format(domain=domain)
     return _TLS_CERT_SELF, _TLS_KEY_SELF
 
@@ -525,13 +547,15 @@ def _build_config(
     secrets: dict[str, str],
     domain: str,
     server_clients: Optional[dict[str, list]] = None,
+    *,
+    tls_mode: str = "certbot",
 ) -> dict:
     """Собирает конфиг xray из шаблона: подставляет секреты, TLS-пути, сохраняет клиентов."""
     text = (LOCAL_DIR / "config.json").read_text(encoding="utf-8")
     text = text.replace("YOUR_UUID", secrets["XRAY_UUID"])
     text = text.replace("YOUR_PRIVATE_KEY", secrets["XRAY_PRIVATE_KEY"])
     text = text.replace("YOUR_SHORT_ID", secrets["XRAY_SHORT_ID"])
-    cert_path, key_path = _tls_cert_paths(domain)
+    cert_path, key_path = _tls_cert_paths(domain, tls_mode)
     text = text.replace("YOUR_TLS_CERT", cert_path)
     text = text.replace("YOUR_TLS_KEY", key_path)
 
@@ -564,8 +588,12 @@ def _upload_files(
     stack_path: str,
     *,
     hysteria_yaml: Optional[str] = None,
+    server: Optional[ServerConfig] = None,
 ) -> None:
     c.run(f"mkdir -p {stack_path}")
+    tls_mode = server.tls_mode if server else "certbot"
+    external_cert = server.external_tls_cert if server else ""
+    external_key = server.external_tls_key if server else ""
 
     _upload_text(
         c, json.dumps(config, ensure_ascii=False, indent=2), f"{stack_path}/config.json"
@@ -582,7 +610,15 @@ def _upload_files(
     )
     print("  ✓ docker-compose.yml")
 
-    if domain:
+    external_override = f"{stack_path}/docker-compose.external.yml"
+    if tls_mode == "external":
+        override = _build_external_compose_override(external_cert, external_key)
+        _upload_text(c, override, external_override)
+        print("  ✓ docker-compose.external.yml")
+    else:
+        c.run(f"rm -f {external_override}", warn=True, hide=True)
+
+    if domain and tls_mode == "certbot":
         nginx_conf = (LOCAL_DIR / "nginx-acme.conf").read_text(encoding="utf-8")
         nginx_conf = nginx_conf.replace("YOUR_DOMAIN", domain)
         _upload_text(c, nginx_conf, f"{stack_path}/nginx-acme.conf")
@@ -604,8 +640,55 @@ def _ensure_docker(c: Connection) -> None:
     print("  ✓ Docker установлен.")
 
 
-def _cert_exists(c: Connection, domain: str, stack_path: str) -> bool:
-    """Проверяет наличие сертификата в Docker-томе letsencrypt."""
+def _compose_files_arg(tls_mode: str) -> str:
+    """Аргумент -f для docker compose в зависимости от режима TLS."""
+    if tls_mode == "external":
+        return "-f docker-compose.yml -f docker-compose.external.yml"
+    return "-f docker-compose.yml"
+
+
+def _build_external_compose_override(cert_host: str, key_host: str) -> str:
+    """Генерирует override для монтирования внешних сертификатов в контейнеры."""
+    mount = (
+        f"      - {cert_host}:{_TLS_CERT_EXTERNAL}:ro\n"
+        f"      - {key_host}:{_TLS_KEY_EXTERNAL}:ro"
+    )
+    return (
+        "services:\n"
+        "  xray:\n"
+        "    volumes:\n"
+        f"{mount}\n"
+        "  hysteria:\n"
+        "    volumes:\n"
+        f"{mount}\n"
+    )
+
+
+def _ensure_external_tls(c: Connection, cert_path: str, key_path: str) -> None:
+    """Проверяет наличие внешних TLS-файлов на хосте."""
+    for path, label in ((cert_path, "сертификат"), (key_path, "ключ")):
+        if not c.run(f"test -f {path}", warn=True, hide=True).ok:
+            raise SystemExit(
+                f"Внешний TLS-{label} не найден: {path}\n"
+                "Проверь external_tls_cert / external_tls_key в SERVERS."
+            )
+    print(f"  ✓ Внешние сертификаты найдены ({cert_path}).")
+
+
+def _cert_exists(
+    c: Connection,
+    domain: str,
+    stack_path: str,
+    server: ServerConfig,
+) -> bool:
+    """Проверяет наличие TLS-сертификата (certbot-том или внешние файлы)."""
+    if server.tls_mode == "external":
+        cert = server.external_tls_cert
+        key = server.external_tls_key
+        return (
+            c.run(f"test -f {cert}", warn=True, hide=True).ok
+            and c.run(f"test -f {key}", warn=True, hide=True).ok
+        )
     proj = _stack_project_name(stack_path)
     vol_data = f"/var/lib/docker/volumes/{proj}_letsencrypt/_data"
     result = c.run(
@@ -616,13 +699,16 @@ def _cert_exists(c: Connection, domain: str, stack_path: str) -> bool:
 
 def _setup_certbot(c: Connection, domain: str, email: str, stack_path: str) -> None:
     """Получает Let's Encrypt сертификат через certbot."""
+    files_arg = _compose_files_arg("certbot")
     print(f"  Запускаем xray-acme-proxy...")
-    c.run(f"cd {stack_path} && docker compose --profile tls up -d xray-acme-proxy")
+    c.run(
+        f"cd {stack_path} && docker compose {files_arg} --profile tls up -d xray-acme-proxy"
+    )
     time.sleep(4)
 
     print(f"  Запрашиваем сертификат для {domain}...")
     c.run(
-        f"cd {stack_path} && docker compose --profile tls run --rm "
+        f"cd {stack_path} && docker compose {files_arg} --profile tls run --rm "
         f"--entrypoint certbot certbot "
         f"certonly --webroot -w /var/www/certbot "
         f"-d {domain} "
@@ -632,10 +718,10 @@ def _setup_certbot(c: Connection, domain: str, email: str, stack_path: str) -> N
     print("  ✓ Сертификат получен.")
 
 
-def _compose_profiles(domain: str, hysteria_enabled: bool) -> str:
+def _compose_profiles(domain: str, hysteria_enabled: bool, tls_mode: str = "certbot") -> str:
     """Возвращает аргумент --profile для docker compose."""
     profiles: list[str] = []
-    if domain:
+    if domain and tls_mode == "certbot":
         profiles.append("tls")
     if hysteria_enabled:
         profiles.append("hysteria")
@@ -645,27 +731,43 @@ def _compose_profiles(domain: str, hysteria_enabled: bool) -> str:
 
 
 def _start_stack(
-    c: Connection, domain: str, stack_path: str, hysteria_enabled: bool
+    c: Connection,
+    domain: str,
+    stack_path: str,
+    hysteria_enabled: bool,
+    tls_mode: str = "certbot",
 ) -> None:
-    profile_arg = _compose_profiles(domain, hysteria_enabled)
-    c.run(f"cd {stack_path} && docker compose {profile_arg} up -d")
-    c.run(f"cd {stack_path} && docker compose restart xray")
+    files_arg = _compose_files_arg(tls_mode)
+    profile_arg = _compose_profiles(domain, hysteria_enabled, tls_mode)
+    c.run(f"cd {stack_path} && docker compose {files_arg} {profile_arg} up -d")
+    c.run(f"cd {stack_path} && docker compose {files_arg} restart xray")
     if hysteria_enabled:
-        c.run(f"cd {stack_path} && docker compose {profile_arg} restart hysteria")
+        c.run(
+            f"cd {stack_path} && docker compose {files_arg} {profile_arg} restart hysteria"
+        )
     else:
         c.run(
-            f"cd {stack_path} && docker compose --profile hysteria stop hysteria",
+            f"cd {stack_path} && docker compose {files_arg} --profile hysteria stop hysteria",
             warn=True,
             hide=True,
         )
         c.run("docker rm -f hysteria", warn=True, hide=True)
 
 
-def _restart_stack(c: Connection, domain: str, stack_path: str, hysteria_enabled: bool) -> None:
-    profile_arg = _compose_profiles(domain, hysteria_enabled)
-    c.run(f"cd {stack_path} && docker compose restart xray")
+def _restart_stack(
+    c: Connection,
+    domain: str,
+    stack_path: str,
+    hysteria_enabled: bool,
+    tls_mode: str = "certbot",
+) -> None:
+    files_arg = _compose_files_arg(tls_mode)
+    profile_arg = _compose_profiles(domain, hysteria_enabled, tls_mode)
+    c.run(f"cd {stack_path} && docker compose {files_arg} restart xray")
     if hysteria_enabled:
-        c.run(f"cd {stack_path} && docker compose {profile_arg} restart hysteria")
+        c.run(
+            f"cd {stack_path} && docker compose {files_arg} {profile_arg} restart hysteria"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -804,27 +906,50 @@ def _deploy_server(server: ServerConfig) -> None:
     else:
         effective_domain = _get_server_domain(server_cfg) if server_cfg else ""
 
-    config = _build_config(secrets, effective_domain, server_clients)
+    if effective_domain and server.tls_mode == "external":
+        if not server.external_tls_cert or not server.external_tls_key:
+            raise SystemExit(
+                f"[{server.host}] tls_mode=external требует "
+                "external_tls_cert и external_tls_key в SERVERS"
+            )
+
+    config = _build_config(
+        secrets, effective_domain, server_clients, tls_mode=server.tls_mode
+    )
     hy_settings = _hysteria_settings()
     hysteria_yaml = (
         _build_hysteria_yaml(
-            _clients_from_reality_config(config), effective_domain, hy_settings
+            _clients_from_reality_config(config),
+            effective_domain,
+            hy_settings,
+            tls_mode=server.tls_mode,
         )
         if hy_settings["enabled"]
         else None
     )
     _upload_files(
-        c, config, effective_domain, sp, hysteria_yaml=hysteria_yaml
+        c,
+        config,
+        effective_domain,
+        sp,
+        hysteria_yaml=hysteria_yaml,
+        server=server,
     )
 
     if effective_domain:
-        print(f"[4/5] TLS-сертификат Let's Encrypt для {effective_domain}...")
-        if _cert_exists(c, effective_domain, sp):
-            print("  Сертификат уже существует, пропускаем.")
+        if server.tls_mode == "external":
+            print(f"[4/5] Внешние TLS-сертификаты для {effective_domain}...")
+            _ensure_external_tls(
+                c, server.external_tls_cert, server.external_tls_key
+            )
         else:
-            if not CERTBOT_EMAIL:
-                raise SystemExit("CERTBOT_EMAIL не задан в .env")
-            _setup_certbot(c, effective_domain, CERTBOT_EMAIL, sp)
+            print(f"[4/5] TLS-сертификат Let's Encrypt для {effective_domain}...")
+            if _cert_exists(c, effective_domain, sp, server):
+                print("  Сертификат уже существует, пропускаем.")
+            else:
+                if not CERTBOT_EMAIL:
+                    raise SystemExit("CERTBOT_EMAIL не задан в .env")
+                _setup_certbot(c, effective_domain, CERTBOT_EMAIL, sp)
     else:
         print("[4/5] Домен не задан — самоподписанный TLS-сертификат...")
         pin = _ensure_self_signed_cert(c, sp, server.host)
@@ -833,12 +958,17 @@ def _deploy_server(server: ServerConfig) -> None:
             _save_secrets(c, sp, secrets)
 
     print("[5/5] Запуск стека...")
-    _start_stack(c, effective_domain, sp, hy_settings["enabled"])
+    _start_stack(c, effective_domain, sp, hy_settings["enabled"], server.tls_mode)
 
     print(f"\n✓ Деплой завершён!")
     print("=== Параметры Reality ===")
     if effective_domain:
-        print(f"  Домен:      {effective_domain} (Let's Encrypt)")
+        tls_label = (
+            "внешний сертификат"
+            if server.tls_mode == "external"
+            else "Let's Encrypt"
+        )
+        print(f"  Домен:      {effective_domain} ({tls_label})")
     else:
         print(f"  TLS:        самоподписанный (SNI={server.host})")
         if secrets.get("XRAY_TLS_PIN_SHA256"):
@@ -907,7 +1037,10 @@ def _add_client_to_server(
     )
     hysteria_yaml = (
         _build_hysteria_yaml(
-            _clients_from_reality_config(config), effective_domain, hy_settings
+            _clients_from_reality_config(config),
+            effective_domain,
+            hy_settings,
+            tls_mode=server.tls_mode,
         )
         if hy_settings["enabled"]
         else None
@@ -921,7 +1054,9 @@ def _add_client_to_server(
     if hysteria_yaml is not None:
         _upload_text(c, hysteria_yaml, f"{sp}/hysteria.yaml")
 
-    _restart_stack(c, effective_domain, sp, hy_settings["enabled"])
+    _restart_stack(
+        c, effective_domain, sp, hy_settings["enabled"], server.tls_mode
+    )
 
     use_le, sni, pin = _get_tls_info(server, config, secrets)
     if not use_le and not pin:
@@ -1068,7 +1203,8 @@ def status(ctx, host=None):
     """
     server = _get_single_server(host)
     c = _conn(server)
-    c.run(f"cd {server.effective_stack_path} && docker compose ps")
+    files_arg = _compose_files_arg(server.tls_mode)
+    c.run(f"cd {server.effective_stack_path} && docker compose {files_arg} ps")
 
 
 @task
@@ -1088,9 +1224,10 @@ def logs(ctx, host=None, lines=50, service="xray"):
     server = _get_single_server(host)
     c = _conn(server)
     sp = server.effective_stack_path
+    files_arg = _compose_files_arg(server.tls_mode)
     profile_arg = "--profile hysteria" if service == "hysteria" else ""
     c.run(
-        f"cd {sp} && docker compose {profile_arg} logs --tail={lines} {service}"
+        f"cd {sp} && docker compose {files_arg} {profile_arg} logs --tail={lines} {service}"
     )
 
 
@@ -1119,5 +1256,11 @@ def restart(ctx, host=None):
             )
         except json.JSONDecodeError:
             pass
-    _restart_stack(c, effective_domain, sp, _hysteria_settings()["enabled"])
+    _restart_stack(
+        c,
+        effective_domain,
+        sp,
+        _hysteria_settings()["enabled"],
+        server.tls_mode,
+    )
     print(f"✓ [{server.host}] стек перезапущен.")
