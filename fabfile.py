@@ -40,6 +40,8 @@ load_dotenv()
 
 _STACK_PATH_DEFAULT: str = os.environ.get("STACK_PATH", "~/xray-server")
 CERTBOT_EMAIL: str = os.environ.get("CERTBOT_EMAIL", "")
+_EXTERNAL_TLS_RELOAD_CRON: str = os.environ.get("EXTERNAL_TLS_RELOAD_CRON", "0 3 * * *")
+_EXTERNAL_TLS_CRON_MARKER_PREFIX = "xray-server-external-tls-reload"
 _HYSTERIA_CERT_SELF = "/etc/hysteria/certs/fullchain.pem"
 _HYSTERIA_KEY_SELF = "/etc/hysteria/certs/privkey.pem"
 
@@ -770,6 +772,79 @@ def _restart_stack(
         )
 
 
+def _external_tls_reload_cron_schedule() -> str:
+    """Расписание cron для подхвата внешних TLS-сертификатов."""
+    schedule = _EXTERNAL_TLS_RELOAD_CRON.strip()
+    if len(schedule.split()) != 5:
+        raise SystemExit(
+            "EXTERNAL_TLS_RELOAD_CRON должен содержать 5 полей cron "
+            f"(минута час день месяц день_недели), получено: {schedule!r}"
+        )
+    return schedule
+
+
+def _external_tls_cron_marker(stack_path: str) -> str:
+    return f"{_EXTERNAL_TLS_CRON_MARKER_PREFIX}:{stack_path}"
+
+
+def _external_tls_reload_command(stack_path: str, hysteria_enabled: bool) -> str:
+    """Команда docker compose для ночного перезапуска TLS-сервисов."""
+    files_arg = _compose_files_arg("external")
+    if hysteria_enabled:
+        profile_arg = _compose_profiles("", True, "external")
+        return (
+            f"cd {stack_path} && docker compose {files_arg} {profile_arg} "
+            "restart xray hysteria"
+        )
+    return f"cd {stack_path} && docker compose {files_arg} restart xray"
+
+
+def _read_crontab(c: Connection) -> str:
+    result = c.run("crontab -l 2>/dev/null || true", warn=True, hide=True)
+    return result.stdout.strip()
+
+
+def _write_crontab(c: Connection, lines: list[str]) -> None:
+    body = "\n".join(lines)
+    if body:
+        body += "\n"
+    _upload_text(c, body, "/tmp/xray-server-crontab.tmp")
+    c.run("crontab /tmp/xray-server-crontab.tmp", hide=True)
+    c.run("rm -f /tmp/xray-server-crontab.tmp", hide=True)
+
+
+def _sync_external_tls_reload_cron(
+    c: Connection,
+    stack_path: str,
+    *,
+    enabled: bool,
+    hysteria_enabled: bool,
+) -> None:
+    """Ставит или удаляет cron на хосте для подхвата внешних TLS-сертификатов."""
+    expanded_path = _expand_remote_path(c, stack_path)
+    marker = _external_tls_cron_marker(expanded_path)
+    old_text = _read_crontab(c)
+    new_lines = [line for line in old_text.splitlines() if marker not in line]
+
+    if enabled:
+        schedule = _external_tls_reload_cron_schedule()
+        reload_cmd = _external_tls_reload_command(expanded_path, hysteria_enabled)
+        log_file = f"/var/log/{_stack_project_name(expanded_path)}-tls-reload.log"
+        new_lines.append(f"{schedule} {reload_cmd} >> {log_file} 2>&1 # {marker}")
+
+    new_text = "\n".join(new_lines).strip()
+    if new_text == old_text:
+        return
+
+    _write_crontab(c, new_lines)
+    if enabled:
+        print(
+            f"  ✓ cron: ночной перезапуск TLS для внешних сертификатов ({schedule})"
+        )
+    else:
+        print("  ✓ cron: задача перезагрузки внешних TLS удалена")
+
+
 # ---------------------------------------------------------------------------
 # Генерация vless-ссылок
 # ---------------------------------------------------------------------------
@@ -959,6 +1034,12 @@ def _deploy_server(server: ServerConfig) -> None:
 
     print("[5/5] Запуск стека...")
     _start_stack(c, effective_domain, sp, hy_settings["enabled"], server.tls_mode)
+    _sync_external_tls_reload_cron(
+        c,
+        sp,
+        enabled=bool(effective_domain and server.tls_mode == "external"),
+        hysteria_enabled=hy_settings["enabled"],
+    )
 
     print(f"\n✓ Деплой завершён!")
     print("=== Параметры Reality ===")

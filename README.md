@@ -277,6 +277,8 @@ Docker-профили:
 - `docker compose --profile tls up -d` — `xray` + `certbot` + `nginx` (с доменом)
 - `docker compose --profile hysteria up -d` — добавляет контейнер `hysteria` (включается через `HYSTERIA_ENABLED=true`)
 
+При `tls_mode=external` `fab deploy` ставит на хосте cron-задачу (`EXTERNAL_TLS_RELOAD_CRON`, по умолчанию `0 3 * * *`), которая перезапускает `xray` и `hysteria` для подхвата обновлённых сертификатов. При смене режима TLS задача удаляется автоматически.
+
 ---
 
 ## Секреты и безопасность
